@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuangjm123/aiconv"
+
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -173,7 +175,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			return http.StatusBadGateway
 		}
 		dest, known := providerProtocol(prov.Protocol, proto)
-		if !known || strings.TrimSpace(prov.Credential) == "" {
+		if !known || len(prov.Keys()) == 0 {
 			s.note(snap, meta, route.id, providerID, CodeUnknown, started, nil)
 			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
 			return http.StatusBadGateway
@@ -214,7 +216,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		if outcome != "" || up.StatusCode < 200 || up.StatusCode >= 300 {
 			limited, _ := readLimited(up.Body, captureLimit)
 			up.Body.Close()
-			usage := usageObject(limited)
+			usage := usageObject(dest, limited)
 			class := outcome
 			if class == "" {
 				s.note(snap, meta, route.id, providerID, "http_"+itoa(up.StatusCode), started, usage)
@@ -228,12 +230,24 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			continue
 		}
 		s.remember(call.Session, providerID)
-		status, usage := s.writeReply(w, r, up, proto, dest, parsed, call, told, ancillary)
+		status, usage, output, complete := s.writeReply(w, r, up, proto, dest, parsed, call, told, ancillary)
 		outcome = OutcomeSuccess
 		if status < 200 || status >= 300 {
 			outcome = string(state.ClassUpstreamUnavailable)
 		}
 		s.note(snap, meta, route.id, providerID, outcome, started, usage)
+		if s.Store != nil && complete && !ancillary && call.Session != "" && status >= 200 && status < 300 {
+			_ = s.Store.AppendTurn(state.TurnRecord{
+				Session:    call.Session,
+				At:         time.Now().UTC(),
+				Model:      meta.Model,
+				Caller:     meta.Caller,
+				ProviderID: providerID,
+				Protocol:   meta.Protocol,
+				Input:      lastUserText(parsed.Messages),
+				Output:     output,
+			})
+		}
 		return status
 	}
 	if !dialed {
@@ -342,6 +356,37 @@ func classifyStatus(status int) string {
 }
 
 func (s *Server) postProvider(ctx context.Context, prov state.Provider, proto Protocol, model string, stream bool, body []byte) (*http.Response, error) {
+	keys := prov.Keys()
+	if len(keys) == 0 {
+		keys = []string{""}
+	}
+	var last *http.Response
+	for i, key := range keys {
+		resp, err := s.postKey(ctx, prov, proto, model, stream, body, key)
+		if err != nil {
+			if last != nil {
+				last.Body.Close()
+			}
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			if last != nil {
+				last.Body.Close()
+			}
+			return resp, nil
+		}
+		if last != nil {
+			last.Body.Close()
+		}
+		last = resp
+		if i == len(keys)-1 {
+			return resp, nil
+		}
+	}
+	return last, nil
+}
+
+func (s *Server) postKey(ctx context.Context, prov state.Provider, proto Protocol, model string, stream bool, body []byte, key string) (*http.Response, error) {
 	target, err := endpoint(prov.BaseURL, proto, model, stream)
 	if err != nil {
 		return nil, err
@@ -356,16 +401,8 @@ func (s *Server) postProvider(ctx context.Context, prov state.Provider, proto Pr
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+prov.Credential)
-	switch proto {
-	case ProtoAnthropic:
-		req.Header.Set("x-api-key", prov.Credential)
-		req.Header.Set("anthropic-version", "2023-06-01")
-	case ProtoGemini:
-		req.Header.Set("x-goog-api-key", prov.Credential)
-	}
-	client := s.httpClient(prov.BaseURL)
-	return client.Do(req)
+	applyProviderAuth(req, proto, key)
+	return s.httpClient(prov.BaseURL).Do(req)
 }
 
 func (s *Server) httpClient(base string) *http.Client {
@@ -384,17 +421,18 @@ func (s *Server) httpClient(base string) *http.Client {
 	}
 }
 
-func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) (int, json.RawMessage) {
+func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) (int, json.RawMessage, string, bool) {
 	defer up.Body.Close()
 	stream := parsed.Stream || strings.Contains(strings.ToLower(up.Header.Get("Content-Type")), "text/event-stream")
 	if stream {
-		return s.writeStream(w, r.Context(), up, inbound, dest, parsed.Model, call, told, ancillary), nil
+		status, usage, output, complete := s.writeStream(w, r.Context(), up, inbound, dest, parsed.Model, call, told, ancillary)
+		return status, usage, output, complete
 	}
 	body, err := readLimited(up.Body, bodyLimit)
 	if err != nil {
 		writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), string(state.ClassUpstreamUnavailable))
 		s.observe(told, call, nil, false)
-		return http.StatusBadGateway, nil
+		return http.StatusBadGateway, nil, "", false
 	}
 	status := up.StatusCode
 	if status == 0 {
@@ -402,7 +440,13 @@ func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Res
 	}
 	out := body
 	if dest != inbound {
-		out = renderReply(inbound, parsed.Model, readReply(dest, body))
+		converted, cerr := aiconv.ConvertReply(aiconv.Protocol(dest), aiconv.Protocol(inbound), body, &aiconv.Options{Model: parsed.Model})
+		if cerr != nil {
+			writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), cerr.Error())
+			s.observe(told, call, nil, false)
+			return http.StatusBadGateway, usageObject(dest, body), "", false
+		}
+		out = converted
 	}
 	if !ancillary {
 		status, out = s.rewriteReply(r.Context(), status, out, call)
@@ -410,12 +454,21 @@ func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Res
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
-	s.observe(told, call, out, len(out) <= captureLimit)
-	return status, usageObject(body)
+	complete := status >= 200 && status < 300 && len(out) <= captureLimit
+	s.observe(told, call, out, complete)
+	output := ""
+	if complete {
+		output = replyText(inbound, out)
+	}
+	return status, usageObject(dest, body), output, complete
 }
 
-func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool) int {
-	w.Header().Set("Content-Type", "text/event-stream")
+func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool) (int, json.RawMessage, string, bool) {
+	if dest != inbound && inbound == ProtoOllama {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+	} else {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
@@ -426,65 +479,96 @@ func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *htt
 	}
 	var captured bytes.Buffer
 	success := true
+	usage := usageScan{proto: dest}
 	editors := s.editors()
 	if dest == inbound && len(editors) == 0 {
-		err := copyFlush(w, up.Body, &captured, flush)
+		truncated, err := copyFlush(io.MultiWriter(&usage, w), up.Body, &captured, flush)
+		usage.finish()
 		if err != nil && !errors.Is(err, io.EOF) {
 			success = false
 		}
-		s.observe(told, call, captureBytes(captured.Bytes(), success), success && captured.Len() <= captureLimit && err == nil)
-		return http.StatusOK
+		complete := success && !truncated && err == nil
+		output := ""
+		if complete {
+			output = joinedStreamText(dest, captured.Bytes())
+		}
+		s.observe(told, call, captureBytes(captured.Bytes(), success), complete)
+		if ancillary {
+			return http.StatusOK, usage.object(), "", false
+		}
+		return http.StatusOK, usage.object(), output, complete
+	}
+	if dest != inbound {
+		return s.convertStream(w, up, inbound, dest, model, call, told, ancillary, flush)
 	}
 	var text strings.Builder
 	err := readSSE(up.Body, func(data []byte) error {
+		usage.see(data)
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			return writeSSE(w, clientEvent(inbound, model, text.String(), true), flush)
 		}
-		piece := eventPieces(dest, data)
-		if dest == inbound {
-			out := data
-			drop := false
-			for _, editor := range editors {
-				next, omit := editor.EditEvent(out)
-				if omit {
-					drop = true
-					break
-				}
-				if next != nil {
-					out = next
-				}
+		out := data
+		drop := false
+		for _, editor := range editors {
+			next, omit := editor.EditEvent(out)
+			if omit {
+				drop = true
+				break
 			}
-			if drop {
-				return nil
+			if next != nil {
+				out = next
 			}
-			return writeSSE(w, out, flush)
 		}
-		if piece.empty() {
+		if drop {
 			return nil
 		}
-		text.WriteString(piece.text)
-		for _, event := range clientPieces(inbound, model, piece) {
-			if err := writeSSE(w, event, flush); err != nil {
-				return err
-			}
-		}
-		return nil
+		text.WriteString(deltaText(inbound, out))
+		return writeSSE(w, out, flush)
 	})
 	if err != nil && !errors.Is(err, io.EOF) {
 		success = false
-	} else if dest != inbound {
-		_ = writeSSE(w, clientEvent(inbound, model, text.String(), true), flush)
+	}
+	complete := success && text.Len() <= captureLimit
+	output := ""
+	if complete && !ancillary {
+		output = text.String()
 	}
 	if ancillary {
-		return http.StatusOK
+		return http.StatusOK, usage.object(), "", false
 	}
-	if dest == inbound {
+	s.observe(told, call, nil, false)
+	return http.StatusOK, usage.object(), output, complete
+}
+
+func (s *Server) convertStream(w http.ResponseWriter, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool, flush func()) (int, json.RawMessage, string, bool) {
+	pr, pw := io.Pipe()
+	usage := usageScan{proto: dest}
+	var captured capWriter
+	captured.limit = captureLimit
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, err := io.Copy(io.MultiWriter(&usage, &captured, pw), up.Body)
+		usage.finish()
+		_ = pw.CloseWithError(err)
+	}()
+	streamErr := aiconv.ConvertStream(aiconv.Protocol(dest), aiconv.Protocol(inbound), pr, flushWriter{w: w, flush: flush}, &aiconv.Options{Model: model})
+	_ = pr.Close()
+	<-done
+	if ancillary {
+		return http.StatusOK, usage.object(), "", false
+	}
+	if streamErr != nil || captured.trunc {
 		s.observe(told, call, nil, false)
-		return http.StatusOK
+		return http.StatusOK, usage.object(), "", false
 	}
-	reply := clientBody(inbound, model, text.String())
-	s.observe(told, call, reply, success && len(reply) <= captureLimit)
-	return http.StatusOK
+	output := spokenText(dest, captured.buf.Bytes())
+	observed, err := aiconv.ConvertReply(aiconv.Protocol(dest), aiconv.Protocol(inbound), captured.buf.Bytes(), &aiconv.Options{Model: model})
+	if err != nil || len(observed) > captureLimit {
+		observed = nil
+	}
+	s.observe(told, call, observed, observed != nil)
+	return http.StatusOK, usage.object(), output, true
 }
 
 func (s *Server) editors() []EventEditor {
@@ -774,19 +858,175 @@ func readLimited(src io.Reader, limit int) ([]byte, error) {
 	return b, nil
 }
 
-func usageObject(body []byte) json.RawMessage {
+// usageObject is the provider's token-count object on a whole JSON reply.
+// A missing object is nil. It is not stored as zero.
+func usageObject(proto Protocol, body []byte) json.RawMessage {
+	return eventUsage(proto, body)
+}
+
+// eventUsage reads one provider event. Chat and responses use usage.
+// A responses event nests it under response. Gemini names it usageMetadata.
+// Anthropic puts input counts on message.usage and output counts on usage;
+// both are returned so the caller can lay the later object over the earlier one.
+func eventUsage(proto Protocol, data []byte) json.RawMessage {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || data[0] != '{' {
+		return nil
+	}
 	var doc map[string]json.RawMessage
-	if json.Unmarshal(body, &doc) != nil {
+	if json.Unmarshal(data, &doc) != nil {
 		return nil
 	}
-	raw := bytes.TrimSpace(doc["usage"])
-	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+	switch proto {
+	case ProtoGemini:
+		if u := objectField(doc["usageMetadata"]); u != nil {
+			return u
+		}
+		return objectField(doc["usage"])
+	case ProtoResponses:
+		if u := nestedUsage(doc["response"]); u != nil {
+			return u
+		}
+		return objectField(doc["usage"])
+	case ProtoAnthropic:
+		u := nestedUsage(doc["message"])
+		if top := objectField(doc["usage"]); top != nil {
+			u = mergeUsage(u, top)
+		}
+		return u
+	default:
+		return objectField(doc["usage"])
+	}
+}
+
+func nestedUsage(raw json.RawMessage) json.RawMessage {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '{' {
 		return nil
 	}
-	if raw[0] != '{' {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+	return objectField(doc["usage"])
+}
+
+func objectField(raw json.RawMessage) json.RawMessage {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) || raw[0] != '{' {
 		return nil
 	}
 	return append(json.RawMessage(nil), raw...)
+}
+
+func mergeUsage(base, next json.RawMessage) json.RawMessage {
+	if len(next) == 0 {
+		return base
+	}
+	if len(base) == 0 {
+		return append(json.RawMessage(nil), next...)
+	}
+	var a, b map[string]json.RawMessage
+	if json.Unmarshal(base, &a) != nil || json.Unmarshal(next, &b) != nil {
+		return append(json.RawMessage(nil), next...)
+	}
+	for k, v := range b {
+		a[k] = append(json.RawMessage(nil), v...)
+	}
+	out, err := json.Marshal(a)
+	if err != nil {
+		return append(json.RawMessage(nil), next...)
+	}
+	return out
+}
+
+// usageScan keeps the provider usage seen on a stream.
+// Chat, responses, and Gemini keep the last object. Anthropic lays each
+// later object over the earlier one, because input and output arrive apart.
+type usageScan struct {
+	proto Protocol
+	raw   json.RawMessage
+	data  bytes.Buffer
+	rest  []byte
+}
+
+func (s *usageScan) Write(p []byte) (int, error) {
+	s.feed(p, false)
+	return len(p), nil
+}
+
+func (s *usageScan) finish() {
+	s.feed(nil, true)
+}
+
+func (s *usageScan) feed(p []byte, eof bool) {
+	if len(p) > 0 {
+		s.rest = append(s.rest, p...)
+	}
+	for {
+		i := bytes.IndexByte(s.rest, '\n')
+		if i < 0 {
+			break
+		}
+		line := s.rest[:i]
+		s.rest = s.rest[i+1:]
+		s.line(line)
+	}
+	if !eof {
+		return
+	}
+	if len(s.rest) > 0 {
+		s.line(s.rest)
+		s.rest = nil
+	}
+	s.flushEvent()
+}
+
+func (s *usageScan) line(line []byte) {
+	line = bytes.TrimRight(line, "\r")
+	if len(line) == 0 {
+		s.flushEvent()
+		return
+	}
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	piece := bytes.TrimPrefix(line, []byte("data:"))
+	piece = bytes.TrimPrefix(piece, []byte(" "))
+	if s.data.Len() > 0 {
+		s.data.WriteByte('\n')
+	}
+	_, _ = s.data.Write(piece)
+}
+
+func (s *usageScan) flushEvent() {
+	if s.data.Len() == 0 {
+		return
+	}
+	s.see(s.data.Bytes())
+	s.data.Reset()
+}
+
+func (s *usageScan) see(event []byte) {
+	if !bytes.Contains(event, []byte("usage")) {
+		return
+	}
+	next := eventUsage(s.proto, event)
+	if next == nil {
+		return
+	}
+	if s.proto == ProtoAnthropic {
+		s.raw = mergeUsage(s.raw, next)
+		return
+	}
+	s.raw = next
+}
+
+func (s *usageScan) object() json.RawMessage {
+	if len(s.raw) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), s.raw...)
 }
 
 func writeUpstreamOrError(w http.ResponseWriter, proto Protocol, status int, body []byte) {
@@ -799,30 +1039,107 @@ func writeUpstreamOrError(w http.ResponseWriter, proto Protocol, status int, bod
 	writeProtocolError(w, proto, status, "upstream", "upstream")
 }
 
-func copyFlush(dst io.Writer, src io.Reader, captured *bytes.Buffer, flush func()) error {
+func copyFlush(dst io.Writer, src io.Reader, captured *bytes.Buffer, flush func()) (bool, error) {
 	buf := make([]byte, 32*1024)
+	truncated := false
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return werr
+				return truncated, werr
 			}
 			if captured != nil && captured.Len() < captureLimit {
 				remain := captureLimit - captured.Len()
 				if n > remain {
+					truncated = true
 					n = remain
 				}
 				_, _ = captured.Write(buf[:n])
+			} else if captured != nil {
+				truncated = true
 			}
 			flush()
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				return truncated, nil
 			}
-			return err
+			return truncated, err
 		}
 	}
+}
+
+func joinedStreamText(proto Protocol, raw []byte) string {
+	var b strings.Builder
+	_ = readSSE(bytes.NewReader(raw), func(data []byte) error {
+		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+			return nil
+		}
+		b.WriteString(deltaText(proto, data))
+		return nil
+	})
+	return b.String()
+}
+
+func lastUserText(messages []turn) string {
+	text := ""
+	for _, msg := range messages {
+		if msg.Role == "user" && msg.Text != "" {
+			text = msg.Text
+		}
+	}
+	return text
+}
+
+type flushWriter struct {
+	w     io.Writer
+	flush func()
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if n > 0 && f.flush != nil {
+		f.flush()
+	}
+	return n, err
+}
+
+type capWriter struct {
+	buf   bytes.Buffer
+	limit int
+	trunc bool
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if c.buf.Len() >= c.limit {
+		c.trunc = true
+		return len(p), nil
+	}
+	remain := c.limit - c.buf.Len()
+	if len(p) > remain {
+		c.trunc = true
+		_, _ = c.buf.Write(p[:remain])
+		return len(p), nil
+	}
+	_, _ = c.buf.Write(p)
+	return len(p), nil
+}
+
+func spokenText(proto Protocol, raw []byte) string {
+	if text := joinedStreamText(proto, raw); text != "" {
+		return text
+	}
+	reply, err := aiconv.DecodeReply(aiconv.Protocol(proto), raw)
+	if err != nil {
+		return replyText(proto, raw)
+	}
+	var b strings.Builder
+	for _, part := range reply.Parts {
+		if part.Kind == aiconv.Text {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
 }
 
 func readSSE(src io.Reader, fn func([]byte) error) error {

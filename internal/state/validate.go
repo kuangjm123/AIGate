@@ -81,7 +81,7 @@ func validateUnique(cfg Config) error {
 func validateRefs(cfg Config) error {
 	providers := map[string]struct{}{}
 	for _, p := range cfg.Providers {
-		if p.Credential == "" {
+		if len(p.Keys()) == 0 {
 			return invalid("credential")
 		}
 		providers[p.ID] = struct{}{}

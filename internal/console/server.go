@@ -1,6 +1,7 @@
 package console
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/respond"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
@@ -42,11 +44,36 @@ type Host interface {
 	Update(fn func(*state.Config) error) error
 }
 
+// ProbeResult is the outcome of one saved-provider check.
+// Error is a fixed code. It does not contain the provider key.
+type ProbeResult struct {
+	OK       bool   `json:"ok"`
+	Status   int    `json:"status,omitempty"`
+	Protocol string `json:"protocol,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
 // Server is the console JSON API and the control page. It does not forward model traffic.
+// Probe, when set, checks one saved provider. A nil Probe does not dial.
 type Server struct {
-	Store *state.Store
-	Host  Host
-	Log   *log.Logger
+	Store       *state.Store
+	Host        Host
+	Log         *log.Logger
+	Probe       func(ctx context.Context, prov state.Provider, consoleListen string) ProbeResult
+	Detect      func(ctx context.Context, base, key, consoleListen string) (protocol, errCode string)
+	FetchModels func(ctx context.Context, base, protocol, key, consoleListen string) (models []string, errCode string)
+	CheckModels func(ctx context.Context, prov state.Provider, consoleListen string) []ModelReport
+	// Agents, when set, is the machine the Agent page reads. Nil uses this computer.
+	Agents *agent.Machine
+}
+
+// ModelReport is one model checked with a short request.
+type ModelReport struct {
+	Model  string `json:"model"`
+	OK     bool   `json:"ok"`
+	Status int    `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 // ServeHTTP dispatches one control request.
@@ -166,6 +193,16 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) int {
 			return methodNotAllowed(w)
 		}
 		return s.listUsage(w, r)
+	case "/conversations":
+		if method != http.MethodGet {
+			return methodNotAllowed(w)
+		}
+		return s.listConversations(w)
+	case "/conversations/turns":
+		if method != http.MethodGet {
+			return methodNotAllowed(w)
+		}
+		return s.readConversation(w, r)
 	case "/listeners":
 		switch method {
 		case http.MethodGet:
@@ -175,12 +212,57 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) int {
 		default:
 			return methodNotAllowed(w)
 		}
+	case "/agents":
+		if method != http.MethodGet {
+			return methodNotAllowed(w)
+		}
+		return s.listAgents(w)
+	}
+	if id, action, ok := agentAction(path); ok {
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		switch action {
+		case "connect":
+			return s.connectAgent(w, id)
+		case "disconnect":
+			return s.disconnectAgent(w, id)
+		}
 	}
 	if id, ok := revokeID(path); ok {
 		if method != http.MethodPost {
 			return methodNotAllowed(w)
 		}
 		return s.revokeToken(w, id)
+	}
+	switch path {
+	case "/providers/detect":
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		return s.detectProvider(w, r)
+	case "/providers/models":
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		return s.fetchProviderModels(w, r)
+	case "/providers/check":
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		return s.checkProviderModels(w, r)
+	}
+	if id, index, ok := providerKeyID(path); ok {
+		if method != http.MethodDelete {
+			return methodNotAllowed(w)
+		}
+		return s.deleteProviderKey(w, id, index)
+	}
+	if id, ok := providerTestID(path); ok {
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		return s.testProvider(w, r, id)
 	}
 	if id, ok := oneID(path, "/providers/"); ok {
 		switch method {
@@ -213,11 +295,13 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) int {
 
 type providerView struct {
 	ID            string            `json:"id"`
+	Name          string            `json:"name"`
 	Protocol      string            `json:"protocol"`
 	BaseURL       string            `json:"baseUrl"`
 	Models        []string          `json:"models"`
 	Info          []state.ModelInfo `json:"info"`
 	CredentialSet bool              `json:"credentialSet"`
+	KeyCount      int               `json:"keyCount"`
 }
 
 func viewProvider(p state.Provider) providerView {
@@ -229,13 +313,16 @@ func viewProvider(p state.Provider) providerView {
 	if info == nil {
 		info = []state.ModelInfo{}
 	}
+	keys := p.Keys()
 	return providerView{
 		ID:            p.ID,
+		Name:          p.Name,
 		Protocol:      p.Protocol,
 		BaseURL:       p.BaseURL,
 		Models:        models,
 		Info:          info,
-		CredentialSet: p.Credential != "",
+		CredentialSet: len(keys) > 0,
+		KeyCount:      len(keys),
 	}
 }
 
@@ -251,16 +338,23 @@ func (s *Server) listProviders(w http.ResponseWriter) int {
 
 func (s *Server) createProvider(w http.ResponseWriter, r *http.Request) int {
 	var in struct {
-		Protocol   string            `json:"protocol"`
-		BaseURL    string            `json:"baseUrl"`
-		Models     []string          `json:"models"`
-		Info       []state.ModelInfo `json:"info"`
-		Credential string            `json:"credential"`
+		Name        string            `json:"name"`
+		Protocol    string            `json:"protocol"`
+		BaseURL     string            `json:"baseUrl"`
+		Models      []string          `json:"models"`
+		Info        []state.ModelInfo `json:"info"`
+		Credential  string            `json:"credential"`
+		Credentials []string          `json:"credentials"`
 	}
 	if err := decode(w, r, &in); err != nil {
 		return badJSON(w)
 	}
-	if in.Credential == "" {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return invalidReason(w, "name")
+	}
+	keys := state.Provider{Credential: in.Credential, Credentials: in.Credentials}.Keys()
+	if len(keys) == 0 {
 		return invalidReason(w, "credential")
 	}
 	if in.Models == nil {
@@ -272,7 +366,10 @@ func (s *Server) createProvider(w http.ResponseWriter, r *http.Request) int {
 		if err != nil {
 			return err
 		}
-		p := state.Provider{ID: id, Protocol: in.Protocol, BaseURL: in.BaseURL, Models: in.Models, Info: in.Info, Credential: in.Credential}
+		p := state.Provider{
+			ID: id, Name: name, Protocol: in.Protocol, BaseURL: in.BaseURL,
+			Models: in.Models, Info: in.Info, Credential: keys[0], Credentials: keys,
+		}
 		cfg.Providers = append(cfg.Providers, p)
 		created = viewProvider(p)
 		return nil
@@ -286,17 +383,20 @@ func (s *Server) createProvider(w http.ResponseWriter, r *http.Request) int {
 
 func (s *Server) putProvider(w http.ResponseWriter, r *http.Request, id string) int {
 	var in struct {
-		Protocol   string             `json:"protocol"`
-		BaseURL    string             `json:"baseUrl"`
-		Models     []string           `json:"models"`
-		Info       *[]state.ModelInfo `json:"info"`
-		Credential *string            `json:"credential"`
+		Name           string             `json:"name"`
+		Protocol       string             `json:"protocol"`
+		BaseURL        string             `json:"baseUrl"`
+		Models         []string           `json:"models"`
+		Info           *[]state.ModelInfo `json:"info"`
+		Credential     *string            `json:"credential"`
+		Credentials    *[]string          `json:"credentials"`
+		AddCredentials []string           `json:"addCredentials"`
 	}
 	if err := decode(w, r, &in); err != nil {
 		return badJSON(w)
 	}
-	if in.Credential != nil && *in.Credential == "" {
-		return invalidReason(w, "credential")
+	if strings.TrimSpace(in.Name) == "" {
+		return invalidReason(w, "name")
 	}
 	if in.Models == nil {
 		in.Models = []string{}
@@ -307,15 +407,182 @@ func (s *Server) putProvider(w http.ResponseWriter, r *http.Request, id string) 
 			if cfg.Providers[i].ID != id {
 				continue
 			}
+			cfg.Providers[i].Name = strings.TrimSpace(in.Name)
 			cfg.Providers[i].Protocol = in.Protocol
 			cfg.Providers[i].BaseURL = in.BaseURL
 			cfg.Providers[i].Models = in.Models
 			if in.Info != nil {
 				cfg.Providers[i].Info = *in.Info
 			}
-			if in.Credential != nil {
-				cfg.Providers[i].Credential = *in.Credential
+			if in.Credentials != nil || in.Credential != nil {
+				one := ""
+				if in.Credential != nil {
+					one = *in.Credential
+				}
+				var list []string
+				if in.Credentials != nil {
+					list = *in.Credentials
+				}
+				keys := state.Provider{Credential: one, Credentials: list}.Keys()
+				if len(keys) == 0 {
+					return &state.ValidationError{Reason: "credential"}
+				}
+				cfg.Providers[i].Credentials = keys
+				cfg.Providers[i].Credential = keys[0]
+			} else if extra := (state.Provider{Credentials: in.AddCredentials}).Keys(); len(extra) > 0 {
+				keys := append(cfg.Providers[i].Keys(), extra...)
+				keys = state.Provider{Credentials: keys}.Keys()
+				cfg.Providers[i].Credentials = keys
+				cfg.Providers[i].Credential = keys[0]
 			}
+			saved = viewProvider(cfg.Providers[i])
+			return nil
+		}
+		return state.ErrNotFound
+	})
+	if err != nil {
+		return writeErr(w, err)
+	}
+	respond.JSON(w, http.StatusOK, saved)
+	return http.StatusOK
+}
+
+func (s *Server) testProvider(w http.ResponseWriter, r *http.Request, id string) int {
+	snap := s.Store.Current()
+	if snap == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "config_unreadable")
+		return http.StatusServiceUnavailable
+	}
+	prov, ok := snap.Config.Provider(id)
+	if !ok {
+		return notFound(w)
+	}
+	if s.Probe == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "unsupported")
+		return http.StatusServiceUnavailable
+	}
+	consoleListen := ""
+	if s.Host != nil {
+		consoleListen = s.Host.Status().Console.Effective
+	}
+	result := s.Probe(r.Context(), prov, consoleListen)
+	respond.JSON(w, http.StatusOK, result)
+	return http.StatusOK
+}
+
+type toolIn struct {
+	ID          string   `json:"id"`
+	BaseURL     string   `json:"baseUrl"`
+	Protocol    string   `json:"protocol"`
+	Credential  string   `json:"credential"`
+	Credentials []string `json:"credentials"`
+	Models      []string `json:"models"`
+}
+
+func (s *Server) prepareTool(in toolIn) (state.Provider, string) {
+	consoleListen := ""
+	if s.Host != nil {
+		consoleListen = s.Host.Status().Console.Effective
+	}
+	var prov state.Provider
+	if in.ID != "" && s.Store != nil && s.Store.Current() != nil {
+		if saved, ok := s.Store.Current().Config.Provider(in.ID); ok {
+			prov = saved
+		}
+	}
+	if strings.TrimSpace(in.BaseURL) != "" {
+		prov.BaseURL = strings.TrimSpace(in.BaseURL)
+	}
+	if in.Protocol != "" || in.ID == "" {
+		prov.Protocol = in.Protocol
+	}
+	if keys := (state.Provider{Credential: in.Credential, Credentials: in.Credentials}).Keys(); len(keys) > 0 {
+		prov.Credentials = keys
+		prov.Credential = keys[0]
+	}
+	if in.Models != nil {
+		prov.Models = in.Models
+		prov.Info = nil
+	}
+	return prov, consoleListen
+}
+
+func (s *Server) detectProvider(w http.ResponseWriter, r *http.Request) int {
+	if s.Detect == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "unsupported")
+		return http.StatusServiceUnavailable
+	}
+	var in toolIn
+	if err := decode(w, r, &in); err != nil {
+		return badJSON(w)
+	}
+	prov, consoleListen := s.prepareTool(in)
+	key := ""
+	if keys := prov.Keys(); len(keys) > 0 {
+		key = keys[0]
+	}
+	protocol, errCode := s.Detect(r.Context(), prov.BaseURL, key, consoleListen)
+	respond.JSON(w, http.StatusOK, map[string]string{"protocol": protocol, "error": errCode})
+	return http.StatusOK
+}
+
+func (s *Server) fetchProviderModels(w http.ResponseWriter, r *http.Request) int {
+	if s.FetchModels == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "unsupported")
+		return http.StatusServiceUnavailable
+	}
+	var in toolIn
+	if err := decode(w, r, &in); err != nil {
+		return badJSON(w)
+	}
+	prov, consoleListen := s.prepareTool(in)
+	key := ""
+	if keys := prov.Keys(); len(keys) > 0 {
+		key = keys[0]
+	}
+	models, errCode := s.FetchModels(r.Context(), prov.BaseURL, prov.Protocol, key, consoleListen)
+	if models == nil {
+		models = []string{}
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{"models": models, "error": errCode})
+	return http.StatusOK
+}
+
+func (s *Server) checkProviderModels(w http.ResponseWriter, r *http.Request) int {
+	if s.CheckModels == nil {
+		respond.Error(w, http.StatusServiceUnavailable, "unsupported")
+		return http.StatusServiceUnavailable
+	}
+	var in toolIn
+	if err := decode(w, r, &in); err != nil {
+		return badJSON(w)
+	}
+	prov, consoleListen := s.prepareTool(in)
+	rows := s.CheckModels(r.Context(), prov, consoleListen)
+	if rows == nil {
+		rows = []ModelReport{}
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{"results": rows})
+	return http.StatusOK
+}
+
+func (s *Server) deleteProviderKey(w http.ResponseWriter, id string, index int) int {
+	var saved providerView
+	err := s.Host.Update(func(cfg *state.Config) error {
+		for i := range cfg.Providers {
+			if cfg.Providers[i].ID != id {
+				continue
+			}
+			keys := cfg.Providers[i].Keys()
+			if index < 0 || index >= len(keys) {
+				return state.ErrNotFound
+			}
+			keys = append(keys[:index], keys[index+1:]...)
+			if len(keys) == 0 {
+				return &state.ValidationError{Reason: "credential"}
+			}
+			cfg.Providers[i].Credentials = keys
+			cfg.Providers[i].Credential = keys[0]
 			saved = viewProvider(cfg.Providers[i])
 			return nil
 		}
@@ -657,6 +924,30 @@ func (s *Server) listUsage(w http.ResponseWriter, r *http.Request) int {
 	return http.StatusOK
 }
 
+func (s *Server) listConversations(w http.ResponseWriter) int {
+	list, err := s.Store.ListConversations()
+	if errors.Is(err, state.ErrConversationUnknown) || err != nil {
+		respond.JSON(w, http.StatusOK, map[string]string{"status": "unknown"})
+		return http.StatusOK
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{"status": "ok", "conversations": list})
+	return http.StatusOK
+}
+
+func (s *Server) readConversation(w http.ResponseWriter, r *http.Request) int {
+	session := r.URL.Query().Get("session")
+	if session == "" {
+		return badJSON(w)
+	}
+	turns, err := s.Store.ReadConversation(session)
+	if errors.Is(err, state.ErrConversationUnknown) || err != nil {
+		respond.JSON(w, http.StatusOK, map[string]string{"status": "unknown"})
+		return http.StatusOK
+	}
+	respond.JSON(w, http.StatusOK, map[string]any{"status": "ok", "turns": turns})
+	return http.StatusOK
+}
+
 func (s *Server) getListeners(w http.ResponseWriter) int {
 	respond.JSON(w, http.StatusOK, s.Host.Status())
 	return http.StatusOK
@@ -737,6 +1028,37 @@ func oneID(path, prefix string) (string, bool) {
 		return "", false
 	}
 	return rest, true
+}
+
+func providerKeyID(path string) (string, int, bool) {
+	rest, ok := strings.CutPrefix(path, "/providers/")
+	if !ok {
+		return "", 0, false
+	}
+	id, rest, ok := strings.Cut(rest, "/keys/")
+	if !ok || id == "" || strings.Contains(id, "/") || rest == "" || strings.Contains(rest, "/") {
+		return "", 0, false
+	}
+	index := 0
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return "", 0, false
+		}
+		index = index*10 + int(r-'0')
+	}
+	return id, index, true
+}
+
+func providerTestID(path string) (string, bool) {
+	rest, ok := strings.CutPrefix(path, "/providers/")
+	if !ok || !strings.HasSuffix(rest, "/test") {
+		return "", false
+	}
+	id := strings.TrimSuffix(rest, "/test")
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
 }
 
 func revokeID(path string) (string, bool) {

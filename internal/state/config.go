@@ -1,6 +1,9 @@
 package state
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // ErrorClass is one failure the gateway keeps separate from the others.
 type ErrorClass string
@@ -43,14 +46,41 @@ type ModelInfo struct {
 }
 
 // Provider is a configured upstream. Protocol is stored and not interpreted.
-// Credential is the upstream key. Console responses do not return it.
+// Name is the label shown in the console. It is not the id.
+// Credential is the first upstream key, kept so an older reader still finds one.
+// Credentials is every key for that same protocol. Console responses do not return either.
 type Provider struct {
-	ID         string      `json:"id"`
-	Protocol   string      `json:"protocol"`
-	BaseURL    string      `json:"baseUrl"`
-	Models     []string    `json:"models"`
-	Info       []ModelInfo `json:"info,omitempty"`
-	Credential string      `json:"credential,omitempty"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name,omitempty"`
+	Protocol    string      `json:"protocol"`
+	BaseURL     string      `json:"baseUrl"`
+	Models      []string    `json:"models"`
+	Info        []ModelInfo `json:"info,omitempty"`
+	Credential  string      `json:"credential,omitempty"`
+	Credentials []string    `json:"credentials,omitempty"`
+}
+
+// Keys returns the provider's upstream keys, credentials first, then a legacy
+// credential that is not already in that list. Empty strings are left out.
+func (p Provider) Keys() []string {
+	seen := map[string]struct{}{}
+	var out []string
+	add := func(key string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	for _, key := range p.Credentials {
+		add(key)
+	}
+	add(p.Credential)
+	return out
 }
 
 // Route matches a model name to an ordered provider list.
@@ -227,6 +257,7 @@ func (c Config) clone() Config {
 	out.Providers = make([]Provider, len(c.Providers))
 	for i, p := range c.Providers {
 		p.Models = append([]string(nil), p.Models...)
+		p.Credentials = append([]string(nil), p.Credentials...)
 		p.Info = cloneInfo(p.Info)
 		out.Providers[i] = p
 	}

@@ -2,6 +2,7 @@ package console
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -31,6 +33,7 @@ func TestConsoleCRUDAndSecrets(t *testing.T) {
 		t.Fatalf("open providers %d %s", res.StatusCode, body)
 	}
 	provider := postJSON(t, ts.URL+"/providers", token, map[string]any{
+		"name":       "local",
 		"protocol":   "openai",
 		"baseUrl":    "http://127.0.0.1:11434/v1",
 		"models":     []string{"m"},
@@ -77,6 +80,7 @@ func TestConsoleCRUDAndSecrets(t *testing.T) {
 	}
 
 	consoleOrigin := postStatus(t, ts.URL+"/providers", token, map[string]any{
+		"name":       "loop",
 		"protocol":   "openai",
 		"baseUrl":    "http://127.0.0.1:8081/v1",
 		"models":     []string{},
@@ -180,6 +184,10 @@ func TestConfigStatusAndModelRejected(t *testing.T) {
 	res, got = do(t, http.MethodPost, srv.URL+"/v1/chat/completions", "", []byte(`{"model":"m"}`))
 	if res.StatusCode != http.StatusForbidden || !strings.Contains(got, "rejected") {
 		t.Fatalf("model %d %s", res.StatusCode, got)
+	}
+	res, got = do(t, http.MethodPost, srv.URL+"/chat/completions", "", []byte(`{"model":"m"}`))
+	if res.StatusCode != http.StatusForbidden || !strings.Contains(got, "rejected") {
+		t.Fatalf("short model path %d %s", res.StatusCode, got)
 	}
 }
 
@@ -308,6 +316,41 @@ func TestListenersKeepTheOtherUserValue(t *testing.T) {
 	}
 	if strings.Contains(string(file), "127.0.0.1:3425") || strings.Contains(string(file), "127.0.0.1:8080") || strings.Contains(string(file), "127.0.0.1:8081") {
 		t.Fatalf("defaults written: %s", file)
+	}
+}
+
+func TestProviderProbeReturnsTheResultWithoutTheKey(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	const credential = "super-secret-value"
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{
+			ID: "p1", Protocol: "chat", BaseURL: "http://127.0.0.1:9", Models: []string{"demo"}, Credential: credential,
+		}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var saw state.Provider
+	srv := &Server{Store: store, Host: memHost{store: store}, Probe: func(_ context.Context, prov state.Provider, consoleListen string) ProbeResult {
+		saw = prov
+		if consoleListen != "127.0.0.1:8081" {
+			t.Fatalf("console %q", consoleListen)
+		}
+		return ProbeResult{OK: false, Status: http.StatusBadGateway, Protocol: "chat", Model: "demo", Error: "upstream_unavailable"}
+	}}
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	res, body := do(t, http.MethodPost, ts.URL+"/providers/p1/test", token, nil)
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `"ok":false`) || !strings.Contains(body, "upstream_unavailable") {
+		t.Fatalf("probe %d %s", res.StatusCode, body)
+	}
+	if strings.Contains(body, credential) || saw.Credential != credential {
+		t.Fatalf("body %s saw key %q", body, saw.Credential)
+	}
+	res, body = do(t, http.MethodPost, ts.URL+"/providers/missing/test", token, nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing %d %s", res.StatusCode, body)
 	}
 }
 
@@ -510,6 +553,90 @@ func do(t *testing.T, method, url, token string, body []byte) (*http.Response, s
 		t.Fatal(err)
 	}
 	return res, string(b)
+}
+
+func TestAgentConnectRestoresThePreviousKey(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{
+			ID: "p", Protocol: "chat", BaseURL: "https://example.com/v1", Models: []string{"demo"}, Credential: "k",
+		}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	machine := agent.Machine{
+		Home:     home,
+		StashDir: filepath.Join(t.TempDir(), "stash"),
+		LookPath: func(string) bool { return false },
+	}
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const previous = "sk-user-secret"
+	if err := os.WriteFile(settings, []byte(`{"env":{"ANTHROPIC_AUTH_TOKEN":"`+previous+`","FOO":"bar"},"model":"sonnet"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Agents: &machine})
+	defer srv.Close()
+
+	res, body := do(t, http.MethodGet, srv.URL+"/agents", "", nil)
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("open agents %d %s", res.StatusCode, body)
+	}
+	listed := mustGET(t, srv.URL+"/agents", token)
+	if strings.Contains(listed, previous) || !strings.Contains(listed, `"id":"claude"`) || !strings.Contains(listed, `"installed":true`) {
+		t.Fatalf("list %s", listed)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/agents/claude/connect", token, nil)
+	if res.StatusCode != http.StatusOK || strings.Contains(body, previous) {
+		t.Fatalf("connect %d %s", res.StatusCode, body)
+	}
+	wired, err := os.ReadFile(settings)
+	if err != nil || !strings.Contains(string(wired), "aigate-claude") || !strings.Contains(string(wired), `"FOO": "bar"`) || strings.Contains(string(wired), previous) {
+		t.Fatalf("wired %s", wired)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/agents/claude/disconnect", token, nil)
+	if res.StatusCode != http.StatusOK || strings.Contains(body, previous) {
+		t.Fatalf("disconnect %d %s", res.StatusCode, body)
+	}
+	back, err := os.ReadFile(settings)
+	if err != nil || !strings.Contains(string(back), previous) || !strings.Contains(string(back), `"FOO": "bar"`) || strings.Contains(string(back), "aigate-claude") {
+		t.Fatalf("restored %s", back)
+	}
+}
+
+func TestAgentConnectRefusesAnEmptyCatalog(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	home := t.TempDir()
+	machine := agent.Machine{Home: home, StashDir: filepath.Join(t.TempDir(), "stash"), LookPath: func(string) bool { return false }}
+	settings := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	down := fixedHost{store: store, status: ListenStatus{Gateway: PortStatus{Listening: false}}}
+	srv := httptest.NewServer(&Server{Store: store, Host: down, Agents: &machine})
+	defer srv.Close()
+	res, body := do(t, http.MethodPost, srv.URL+"/agents/claude/connect", token, nil)
+	if res.StatusCode != http.StatusConflict || !strings.Contains(body, "not_listening") {
+		t.Fatalf("down %d %s", res.StatusCode, body)
+	}
+	up := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Agents: &machine})
+	defer up.Close()
+	res, body = do(t, http.MethodPost, up.URL+"/agents/claude/connect", token, nil)
+	if res.StatusCode != http.StatusConflict || !strings.Contains(body, "no_models") {
+		t.Fatalf("empty %d %s", res.StatusCode, body)
+	}
+	if raw, err := os.ReadFile(settings); err != nil || string(raw) != "{}\n" {
+		t.Fatalf("file %s", raw)
+	}
 }
 
 func osRead(path string) ([]byte, error) { return os.ReadFile(path) }

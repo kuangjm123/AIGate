@@ -11,6 +11,7 @@ The [README](../../README.md) states the product. It does not name subsystems, a
 | [Gateway](gateway.md) | Token check, the attempt loop, and the closed no-dialect path |
 | [Console](console.md) | The control page and the JSON API on the console port |
 | [Security](security.md) | Bind addresses, secret masking, and provider base URLs |
+| [Agent wiring](agent-wiring.md) | Detect a local coding agent, point its config at the gateway, and put the previous values back |
 
 Add a row only in the same change that adds the source the page describes.
 

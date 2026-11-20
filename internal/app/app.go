@@ -48,7 +48,29 @@ func New(store *state.Store, logger *log.Logger) *App {
 	}
 	a := &App{store: store, log: logger}
 	a.gateway = &gateway.Server{Store: store, Log: logger}
-	a.console = &console.Server{Store: store, Host: a, Log: logger}
+	a.console = &console.Server{
+		Store: store, Host: a, Log: logger,
+		Probe: func(ctx context.Context, prov state.Provider, consoleListen string) console.ProbeResult {
+			got := a.gateway.Probe(ctx, prov, consoleListen)
+			return console.ProbeResult{OK: got.OK, Status: got.Status, Protocol: got.Protocol, Model: got.Model, Error: got.Error}
+		},
+		Detect: func(ctx context.Context, base, key, consoleListen string) (string, string) {
+			got := a.gateway.Detect(ctx, base, key, consoleListen)
+			return got.Protocol, got.Error
+		},
+		FetchModels: func(ctx context.Context, base, protocol, key, consoleListen string) ([]string, string) {
+			got := a.gateway.FetchModels(ctx, base, protocol, key, consoleListen)
+			return got.Models, got.Error
+		},
+		CheckModels: func(ctx context.Context, prov state.Provider, consoleListen string) []console.ModelReport {
+			rows := a.gateway.CheckModels(ctx, prov, consoleListen)
+			out := make([]console.ModelReport, len(rows))
+			for i, row := range rows {
+				out[i] = console.ModelReport{Model: row.Model, OK: row.OK, Status: row.Status, Error: row.Error}
+			}
+			return out
+		},
+	}
 	return a
 }
 

@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { api } from "./api.js";
-import { Connect, Listeners, Plugins, Providers, Routes, Tokens, Usage } from "./sections.jsx";
+import { Agents, Connect, Conversations, Listeners, Plugins, Providers, Routes, Tokens, Usage } from "./sections.jsx";
 
 const sections = [
+  ["agents", "Agent"],
   ["connect", "接入"],
   ["listeners", "监听"],
   ["providers", "提供方"],
@@ -10,10 +11,11 @@ const sections = [
   ["plugins", "插件"],
   ["tokens", "网关令牌"],
   ["usage", "用量"],
+  ["conversations", "对话"],
 ];
 
 export function Console({ username, onLogout }) {
-  const [section, setSection] = useState("connect");
+  const [section, setSection] = useState("agents");
   const [message, setMessage] = useState(null);
   const [tick, setTick] = useState(0);
 
@@ -32,6 +34,7 @@ export function Console({ username, onLogout }) {
   }
 
   const panel = {
+    agents: <Agents tick={tick} setMessage={setMessage} />,
     connect: <Connect tick={tick} />,
     listeners: <Listeners tick={tick} refresh={refresh} setMessage={setMessage} />,
     providers: <Providers tick={tick} refresh={refresh} setMessage={setMessage} />,
@@ -39,6 +42,7 @@ export function Console({ username, onLogout }) {
     plugins: <Plugins tick={tick} refresh={refresh} setMessage={setMessage} />,
     tokens: <Tokens tick={tick} refresh={refresh} setMessage={setMessage} />,
     usage: <Usage tick={tick} setMessage={setMessage} />,
+    conversations: <Conversations tick={tick} setMessage={setMessage} />,
   }[section];
 
   return (

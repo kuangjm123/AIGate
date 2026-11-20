@@ -5,7 +5,7 @@ These pages record decisions this repository has not implemented. A [subsystem r
 | Page | What is still open |
 | --- | --- |
 | [Ports](ports.md) | Nothing of the port split is still open |
-| [Gateway](gateway.md) | Which agents get a file migration, and how a plugin is loaded |
+| [Gateway](gateway.md) | How a plugin is loaded |
 | [State](state.md) | Encryption of the config file at rest |
 | [Security](security.md) | Nothing of the non-loopback gateway confirmation is still open |
 

@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
+
+	"github.com/kuangjm123/aiconv"
 
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -24,15 +27,18 @@ const (
 // Classify reports the dialect of an application request.
 // A catalog read is reported as chat, responses' list, ollama, or gemini
 // according to the path. Other methods and paths are not dialects.
+// An application whose base URL is only the gateway origin appends the path
+// its own SDK uses, so the version prefix is optional: /chat/completions is
+// chat, /responses is responses, and /messages is anthropic.
 func Classify(r *http.Request) (Protocol, bool) {
 	if r == nil || r.URL == nil {
 		return "", false
 	}
-	path := r.URL.Path
+	p := path.Clean(r.URL.Path)
 	switch r.Method {
 	case http.MethodGet:
-		switch path {
-		case "/v1/models":
+		switch p {
+		case "/v1/models", "/models":
 			return ProtoChat, true
 		case "/api/tags":
 			return ProtoOllama, true
@@ -45,24 +51,31 @@ func Classify(r *http.Request) (Protocol, bool) {
 	default:
 		return "", false
 	}
-	switch path {
-	case "/v1/chat/completions":
+	switch p {
+	case "/v1/chat/completions", "/chat/completions":
 		return ProtoChat, true
-	case "/v1/responses":
+	case "/v1/responses", "/responses":
 		return ProtoResponses, true
-	case "/v1/messages":
+	case "/v1/messages", "/messages":
 		return ProtoAnthropic, true
 	case "/api/chat":
 		return ProtoOllama, true
 	}
-	if model, method, ok := geminiCall(path); ok && model != "" && (method == "generateContent" || method == "streamGenerateContent") {
+	if model, method, ok := geminiCall(p); ok && model != "" && (method == "generateContent" || method == "streamGenerateContent") {
 		return ProtoGemini, true
 	}
 	return "", false
 }
 
-func geminiCall(path string) (model, method string, ok bool) {
-	rest, found := strings.CutPrefix(path, "/v1beta/models/")
+func geminiCall(requestPath string) (model, method string, ok bool) {
+	rest := ""
+	found := false
+	for _, prefix := range []string{"/v1beta/models/", "/models/"} {
+		rest, found = strings.CutPrefix(requestPath, prefix)
+		if found {
+			break
+		}
+	}
 	if !found || rest == "" || strings.Contains(rest, "/") {
 		return "", "", false
 	}
@@ -85,35 +98,13 @@ type Parsed struct {
 	Model    string
 	Stream   bool
 	Messages []turn
-	Specs    []toolSpec
 	Tools    []byte
 	Raw      []byte
 }
 
-type toolSpec struct {
-	Name        string
-	Description string
-	Parameters  json.RawMessage
-}
-
-type toolCall struct {
-	ID        string
-	Name      string
-	Arguments string
-}
-
-type toolResult struct {
-	ID      string
-	Name    string
-	Content string
-}
-
 type turn struct {
-	Role      string
-	Text      string
-	Reasoning string
-	Calls     []toolCall
-	Result    *toolResult
+	Role string
+	Text string
 }
 
 // Parse reads a dialect body. The Gemini model and stream flag come from the path.
@@ -145,7 +136,7 @@ func Parse(proto Protocol, r *http.Request, body []byte) (Parsed, error) {
 		p.Stream = jsonBool(doc["stream"])
 		p.Messages = chatTurns(doc["messages"])
 	case ProtoGemini:
-		model, method, ok := geminiCall(r.URL.Path)
+		model, method, ok := geminiCall(path.Clean(r.URL.Path))
 		if !ok {
 			return Parsed{}, errBadBody
 		}
@@ -158,7 +149,6 @@ func Parse(proto Protocol, r *http.Request, body []byte) (Parsed, error) {
 	if strings.TrimSpace(p.Model) == "" {
 		return Parsed{}, errBadBody
 	}
-	enrichParsed(&p, doc)
 	return p, nil
 }
 
@@ -360,7 +350,8 @@ func providerProtocol(stored string, inbound Protocol) (Protocol, bool) {
 
 // outboundBody is the JSON sent to one provider.
 // The same dialect keeps the caller's body, with the upstream model name.
-// A different dialect is translated, including tool declarations, tool calls, and reasoning text.
+// A different dialect is rewritten by aiconv. The stream flag is the one Parse
+// recorded, because Gemini carries it on the URL.
 // upstream is the model name that provider lists. The caller's catalog id stays on the reply.
 func outboundBody(inbound Parsed, raw []byte, dest Protocol, upstream string) ([]byte, error) {
 	if upstream == "" {
@@ -369,18 +360,32 @@ func outboundBody(inbound Parsed, raw []byte, dest Protocol, upstream string) ([
 	if dest == inbound.Protocol {
 		return withModel(raw, upstream), nil
 	}
-	if hasTools(inbound.Tools) && len(inbound.Specs) == 0 {
-		return nil, errTools
-	}
-	return translatedBody(inbound, dest, upstream)
-}
-
-func marshal(v any) ([]byte, error) {
-	b, err := json.Marshal(v)
+	turn, err := aiconv.DecodeTurn(aiconv.Protocol(inbound.Protocol), raw)
 	if err != nil {
 		return nil, err
 	}
-	return b, nil
+	if hasTools(inbound.Tools) && len(turn.Tools) == 0 && !turn.WebSearch && len(turn.Native.Gemini.Tools) == 0 {
+		return nil, errTools
+	}
+	turn.Stream = inbound.Stream
+	return aiconv.EncodeTurn(aiconv.Protocol(dest), turn, &aiconv.Options{Model: upstream})
+}
+
+func withModel(raw []byte, model string) []byte {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil || model == "" {
+		return append([]byte(nil), raw...)
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	doc["model"] = encoded
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	return out
 }
 
 // replyText reads the assistant text from a provider body in its dialect.

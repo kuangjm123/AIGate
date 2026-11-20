@@ -63,6 +63,63 @@ func TestRemoteMagpieKeyIsRejected(t *testing.T) {
 	}
 }
 
+func TestLocalAigateKeyAndVendorHeadersAreTheCaller(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{
+		{ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k"},
+	}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	body := `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`
+	call := func(set func(*http.Request)) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:9"
+		set(req)
+		rr := httptest.NewRecorder()
+		(&Server{Store: store}).ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("local %d %s", rr.Code, rr.Body.String())
+		}
+	}
+	call(func(r *http.Request) { r.Header.Set("Authorization", "Bearer aigate-claude") })
+	call(func(r *http.Request) { r.Header.Set("x-goog-api-key", "aigate-gemini") })
+	call(func(r *http.Request) { r.Header.Set("x-api-key", secret) })
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 3 {
+		t.Fatalf("usage err %v recs %+v", err, recs)
+	}
+	if recs[0].Caller != "aigate-claude" || recs[0].TokenID != "" {
+		t.Fatalf("aigate caller %+v", recs[0])
+	}
+	if recs[1].Caller != "aigate-gemini" || recs[1].TokenID != "" {
+		t.Fatalf("gemini caller %+v", recs[1])
+	}
+	if recs[2].Caller != "tok" || recs[2].TokenID != "tok" {
+		t.Fatalf("issued key header %+v", recs[2])
+	}
+}
+
+func TestRemoteVendorHeaderWithoutATokenIsRejected(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("remote vendor header dialed")
+	}))
+	defer up.Close()
+	store, _ := dialStore(t, []state.Provider{
+		{ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k"},
+	}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"demo","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("x-goog-api-key", "aigate-gemini")
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	req.RemoteAddr = "127.0.0.1:9"
+	rr := httptest.NewRecorder()
+	(&Server{Store: store}).ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized || !strings.Contains(rr.Body.String(), "auth_failure") {
+		t.Fatalf("remote %d %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestHiddenModelIsAbsentAndRejected(t *testing.T) {
 	var hits atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -195,5 +252,57 @@ func TestImageModelsStayOffTheChatList(t *testing.T) {
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &doc); err != nil || len(doc.Data) != 1 || doc.Data[0].ID != "p1/pic" || doc.Data[0].Name != "Picture" {
 		t.Fatalf("image list %s", rr.Body.String())
+	}
+}
+
+func TestStreamJoinsIntoOneConversationTurn(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{
+		{ID: "p1", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k"},
+	}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	srv := &Server{Store: store}
+	body := `{"model":"demo","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	post := func(session, kind string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+secret)
+		if session != "" {
+			req.Header.Set("x-session-id", session)
+		}
+		if kind != "" {
+			req.Header.Set("x-aigate-kind", kind)
+		}
+		rr := httptest.NewRecorder()
+		srv.ServeHTTP(rr, req)
+		return rr
+	}
+	if rr := post("conv-1", ""); rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "hel") || !strings.Contains(rr.Body.String(), "lo") {
+		t.Fatalf("stream %d %s", rr.Code, rr.Body.String())
+	}
+	if rr := post("conv-1", ""); rr.Code != http.StatusOK {
+		t.Fatalf("second %d", rr.Code)
+	}
+	if rr := post("", ""); rr.Code != http.StatusOK {
+		t.Fatalf("no session %d", rr.Code)
+	}
+	if rr := post("conv-1", "title"); rr.Code != http.StatusOK {
+		t.Fatalf("title %d", rr.Code)
+	}
+	turns, err := store.ReadConversation("conv-1")
+	if err != nil || len(turns) != 2 || turns[0].Output != "hello" || turns[1].Output != "hello" || turns[0].Input != "hi" {
+		t.Fatalf("turns %v %+v", err, turns)
+	}
+	list, err := store.ListConversations()
+	if err != nil || len(list) != 1 || list[0].Session != "conv-1" || list[0].Turns != 2 {
+		t.Fatalf("list %v %+v", err, list)
+	}
+	none, err := store.ReadConversation("missing")
+	if err != nil || len(none) != 0 {
+		t.Fatalf("missing %v %d", err, len(none))
 	}
 }

@@ -104,6 +104,7 @@ func PublicView(cfg state.Config) View {
 	for i, p := range cfg.Providers {
 		p.Models = append([]string(nil), p.Models...)
 		p.Credential = ""
+		p.Credentials = nil
 		v.Providers[i] = p
 	}
 	for i, r := range cfg.Routes {

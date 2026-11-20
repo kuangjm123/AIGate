@@ -47,7 +47,7 @@ button {
 button.ghost { background: transparent; color: var(--accent); }
 button.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
-.layout { display: grid; grid-template-columns: 180px 1fr; min-height: calc(100vh - 62px); }
+.layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); min-height: calc(100vh - 62px); }
 nav { padding: 16px 12px; border-right: 1px solid var(--line); }
 nav button {
   display: block;
@@ -59,7 +59,7 @@ nav button {
   border-color: transparent;
 }
 nav button.active { background: var(--accent); color: #f7f3ea; border-color: var(--accent); }
-main { padding: 20px 24px 48px; }
+main { min-width: 0; padding: 20px 24px 48px; }
 .status { font-size: 13px; color: var(--muted); }
 .pill { display: inline-block; padding: 2px 8px; border-radius: 99px; background: #ece6da; }
 .pill.ok { background: #e4f0e8; color: var(--ok); }
@@ -72,8 +72,9 @@ main { padding: 20px 24px 48px; }
 .note { background: #fff8ea; color: var(--warn); }
 .error { background: #f6e4e4; color: var(--danger); }
 .secret { background: #e4f0e8; }
+.table-wrap { max-width: 100%; overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; background: var(--panel); }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; }
 form.grid, .filters {
   display: grid;
@@ -83,6 +84,15 @@ form.grid, .filters {
   align-items: end;
 }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+label select { width: 100%; }
+.form-note, .keys, .checks, form.grid .row-actions { grid-column: 1 / -1; }
+.form-note { margin: 0; }
+.keys { display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--muted); }
+.key-row { display: flex; gap: 8px; align-items: center; }
+.key-row input { flex: 1; }
+.checks { margin: 0; padding-left: 18px; }
+.checks .ok { color: var(--ok); }
+.checks .bad { color: var(--danger); }
 .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 code { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
 .gate { max-width: 420px; }
@@ -94,3 +104,5 @@ button.link {
   padding: 0;
   text-decoration: underline;
 }
+.turn { margin: 12px 0; padding-top: 8px; border-top: 1px solid var(--line, #ddd); }
+.turn-text { white-space: pre-wrap; }

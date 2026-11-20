@@ -27,6 +27,7 @@ type Store struct {
 	mu      sync.RWMutex
 	writeMu sync.Mutex
 	usageMu sync.Mutex
+	convMu  sync.Mutex
 	snap    *Snapshot
 	hash    func([]byte) (string, error)
 }
