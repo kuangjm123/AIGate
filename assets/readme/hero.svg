@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="490" viewBox="0 0 1200 490" role="img" aria-labelledby="title desc">
+  <title id="title">AIGate</title>
+  <desc id="desc">本机网关。编程助手只对接一个地址，模型请求走 3425，控制台走 8081，再转到 API 供应商或本机订阅。</desc>
+  <rect width="1200" height="460" rx="20" fill="#f5f7fb"/>
+  <text x="64" y="78" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">本机网关</text>
+  <text x="64" y="152" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="72" font-weight="700">AIGate</text>
+  <text x="64" y="204" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="26">编程助手只对接这一个地址。</text>
+  <text x="64" y="242" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="22">协议照旧收下，转给供应商或订阅，回复再翻回去。</text>
+
+  <rect x="56" y="286" width="300" height="148" rx="12" fill="#ffffff" stroke="#e5e9f0"/>
+  <rect x="76" y="308" width="28" height="28" rx="8" fill="#eef2ff"/>
+  <text x="83" y="328" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16" font-weight="700">01</text>
+  <text x="116" y="330" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="600">编程助手</text>
+  <text x="76" y="374" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">Claude · Codex</text>
+  <text x="76" y="404" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">WorkBuddy</text>
+
+  <path d="M368 360 H418" stroke="#c5cbe0" stroke-width="2" fill="none"/>
+  <path d="M410 354 L422 360 L410 366" stroke="#4f46e5" stroke-width="2" fill="none"/>
+
+  <rect x="430" y="286" width="340" height="148" rx="12" fill="#ffffff" stroke="#4f46e5" stroke-width="1.5"/>
+  <rect x="450" y="308" width="28" height="28" rx="8" fill="#4f46e5"/>
+  <text x="456" y="328" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16" font-weight="700">02</text>
+  <text x="490" y="330" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="600">网关</text>
+  <text x="450" y="378" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="22" font-weight="700">3425</text>
+  <text x="518" y="378" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">模型</text>
+  <text x="600" y="378" fill="#697386" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="22" font-weight="700">8081</text>
+  <text x="668" y="378" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">控制台</text>
+
+  <path d="M782 360 H832" stroke="#c5cbe0" stroke-width="2" fill="none"/>
+  <path d="M824 354 L836 360 L824 366" stroke="#4f46e5" stroke-width="2" fill="none"/>
+
+  <rect x="844" y="286" width="300" height="148" rx="12" fill="#ffffff" stroke="#e5e9f0"/>
+  <rect x="864" y="308" width="28" height="28" rx="8" fill="#eef2ff"/>
+  <text x="871" y="328" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="16" font-weight="700">03</text>
+  <text x="904" y="330" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="22" font-weight="600">上游</text>
+  <text x="864" y="374" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">API 供应商</text>
+  <text x="864" y="404" fill="#697386" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="20">本机订阅</text>
+</svg>
