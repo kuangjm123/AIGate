@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/kuangjm123/AIGate/internal/console"
+	"github.com/kuangjm123/AIGate/internal/login"
 	"github.com/kuangjm123/AIGate/internal/respond"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
@@ -24,6 +25,8 @@ type Server struct {
 	consoleListen atomic.Value
 	stickyMu      sync.Mutex
 	sticky        map[string]string
+	// Login reads subscription sign-ins for catalog and dial. Nil reads none.
+	Login func() login.Machine
 }
 
 // ServeHTTP rejects console routes, requires a gateway token, then serves a
@@ -66,7 +69,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) int {
 		return http.StatusServiceUnavailable
 	}
 	if r.Method == http.MethodGet {
-		writeCatalog(w, proto, snap.Config, admitted.allow, r.URL.Query().Get("kind"))
+		writeCatalog(w, proto, snap.Config, admitted.allow, r.URL.Query().Get("kind"), s.loginEntries(r.URL.Query().Get("kind")))
 		return http.StatusOK
 	}
 	return s.serveModel(w, r, snap, proto, admitted)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuangjm123/AIGate/internal/agent"
+	"github.com/kuangjm123/AIGate/internal/login"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -553,6 +554,71 @@ func do(t *testing.T, method, url, token string, body []byte) (*http.Response, s
 		t.Fatal(err)
 	}
 	return res, string(b)
+}
+
+func TestAccountsAreNotCopiedIntoConfig(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	home := t.TempDir()
+	const secret = "sk-ant-oat-secret"
+	path := filepath.Join(home, ".claude", ".credentials.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{"claudeAiOauth":{"accessToken":"`+secret+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Logins: func() login.Machine {
+		off := false
+		if snap := store.Current(); snap != nil {
+			off = snap.Config.NoAccountDiscovery
+		}
+		return login.Machine{Home: home, Off: off}
+	}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/accounts", token)
+	if strings.Contains(body, secret) || !strings.Contains(body, "login/claude/claude-sonnet-4-6") {
+		t.Fatalf("accounts %s", body)
+	}
+	saved, err := os.ReadFile(store.Paths().ConfigFile)
+	if err != nil || strings.Contains(string(saved), secret) {
+		t.Fatalf("config copied the token %s %v", saved, err)
+	}
+	res, got := do(t, http.MethodPut, srv.URL+"/accounts/discovery", token, []byte(`{"on":false}`))
+	if res.StatusCode != http.StatusOK || !strings.Contains(got, `"status":"off"`) {
+		t.Fatalf("off %d %s", res.StatusCode, got)
+	}
+}
+
+func TestWorkBuddyKeyIsNotCopiedIntoConfig(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	const key = "ck_test0000000000abcdefgh"
+	authFile := filepath.Join(t.TempDir(), "workbuddy-auth.json")
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v3/config" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"code":0,"data":{"agents":[{"name":"cli","models":["glm-9"]}],"models":[{"id":"glm-9","name":"GLM-9"}]}}`))
+	}))
+	defer api.Close()
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Logins: func() login.Machine {
+		return login.Machine{Home: t.TempDir(), WorkBuddyStore: authFile, WorkBuddyAPI: api.URL, Client: api.Client()}
+	}})
+	defer srv.Close()
+	res, body := do(t, http.MethodPost, srv.URL+"/accounts/workbuddy", token, []byte(`{"build":"workbuddy","apiKey":"`+key+`"}`))
+	if res.StatusCode != http.StatusOK || strings.Contains(body, key) || !strings.Contains(body, "login/workbuddy#key-abcdefgh/glm-9") {
+		t.Fatalf("accounts %d %s", res.StatusCode, body)
+	}
+	saved, err := os.ReadFile(store.Paths().ConfigFile)
+	if err != nil || strings.Contains(string(saved), key) {
+		t.Fatalf("config %s %v", saved, err)
+	}
+	own, err := os.ReadFile(authFile)
+	if err != nil || !strings.Contains(string(own), key) {
+		t.Fatalf("store %s %v", own, err)
+	}
 }
 
 func TestAgentConnectRestoresThePreviousKey(t *testing.T) {

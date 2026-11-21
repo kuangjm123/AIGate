@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kuangjm123/AIGate/internal/agent"
+	"github.com/kuangjm123/AIGate/internal/login"
 	"github.com/kuangjm123/AIGate/internal/respond"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
@@ -66,6 +67,8 @@ type Server struct {
 	CheckModels func(ctx context.Context, prov state.Provider, consoleListen string) []ModelReport
 	// Agents, when set, is the machine the Agent page reads. Nil uses this computer.
 	Agents *agent.Machine
+	// Logins, when set, reads subscription sign-ins. Nil reads none.
+	Logins func() login.Machine
 }
 
 // ModelReport is one model checked with a short request.
@@ -217,6 +220,21 @@ func (s *Server) dispatch(w http.ResponseWriter, r *http.Request) int {
 			return methodNotAllowed(w)
 		}
 		return s.listAgents(w)
+	case "/accounts":
+		if method != http.MethodGet {
+			return methodNotAllowed(w)
+		}
+		return s.listAccounts(w)
+	case "/accounts/workbuddy":
+		if method != http.MethodPost {
+			return methodNotAllowed(w)
+		}
+		return s.postWorkBuddy(w, r)
+	case "/accounts/discovery":
+		if method != http.MethodPut {
+			return methodNotAllowed(w)
+		}
+		return s.putAccountDiscovery(w, r)
 	}
 	if id, action, ok := agentAction(path); ok {
 		if method != http.MethodPost {

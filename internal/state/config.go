@@ -204,6 +204,9 @@ type Config struct {
 	Plugins       []Plugin       `json:"plugins"`
 	GatewayTokens []GatewayToken `json:"gatewayTokens"`
 	Users         []User         `json:"users"`
+	// NoAccountDiscovery, when true, stops the process from reading coding-agent
+	// sign-ins on this computer. Absent means those sign-ins are read.
+	NoAccountDiscovery bool `json:"noAccountDiscovery,omitempty"`
 }
 
 func emptyConfig() Config {

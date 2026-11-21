@@ -12,6 +12,7 @@ The [README](../../README.md) states the product. It does not name subsystems, a
 | [Console](console.md) | The control page and the JSON API on the console port |
 | [Security](security.md) | Bind addresses, secret masking, and provider base URLs |
 | [Agent wiring](agent-wiring.md) | Detect a local coding agent, point its config at the gateway, and put the previous values back |
+| [Accounts](accounts.md) | Read a local subscription sign-in as a provider without copying the credential |
 
 Add a row only in the same change that adds the source the page describes.
 

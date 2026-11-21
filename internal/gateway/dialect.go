@@ -693,8 +693,8 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 	return out
 }
 
-func writeCatalog(w http.ResponseWriter, proto Protocol, cfg state.Config, allow []string, kind string) {
-	entries := catalog(cfg, kind)
+func writeCatalog(w http.ResponseWriter, proto Protocol, cfg state.Config, allow []string, kind string, extra []catalogEntry) {
+	entries := append(catalog(cfg, kind), extra...)
 	filtered := entries[:0]
 	for _, entry := range entries {
 		if state.AllowsModel(allow, entry.ID, entry.Bare) {

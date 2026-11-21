@@ -11,11 +11,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/kuangjm123/AIGate/internal/console"
 	"github.com/kuangjm123/AIGate/internal/gateway"
+	"github.com/kuangjm123/AIGate/internal/login"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -264,4 +267,31 @@ func shutdownServer(srv *http.Server) {
 func (a *App) closeAll() {
 	a.gw.close()
 	a.cs.close()
+}
+
+// EnableAccounts turns on reading subscription sign-ins from this computer.
+// Tests leave it unset so they do not touch a real agent login.
+func (a *App) EnableAccounts() {
+	a.gateway.Login = a.loginMachine
+	a.console.Logins = a.loginMachine
+}
+
+func (a *App) loginMachine() login.Machine {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	machine := login.Machine{Home: home, WorkBuddyAuth: login.DesktopAuthDir()}
+	if paths := a.store.Paths(); paths.ConfigFile != "" {
+		machine.WorkBuddyStore = filepath.Join(filepath.Dir(paths.ConfigFile), "workbuddy-auth.json")
+	}
+	if snap := a.store.Current(); snap != nil {
+		machine.Off = snap.Config.NoAccountDiscovery
+		for _, plugin := range snap.Config.Plugins {
+			if plugin.Enabled {
+				machine.PluginIDs = append(machine.PluginIDs, plugin.ID)
+			}
+		}
+	}
+	return machine
 }

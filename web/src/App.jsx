@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, clearSession, loadSession, onUnauthorized, saveSession } from "./api.js";
 import { Console } from "./Console.jsx";
+import { Brand } from "./components/ui.jsx";
 
 export function App() {
   const [session, setSession] = useState(loadSession);
@@ -64,12 +65,13 @@ function Gate({ onLogin }) {
         setPill("配置不可读");
         setPillClass("pill bad");
         setMessage(blockedNote);
+      } else {
+        setPill("服务正常");
+        setPillClass("pill ok");
       }
     }).catch((err) => {
-      if (err.status === 401) {
-        setPill("未登录");
-        setPillClass("pill");
-      }
+      setPill(err.status === 401 ? "未登录" : "状态未知");
+      setPillClass("pill");
     });
   }, []);
 
@@ -111,34 +113,21 @@ function Gate({ onLogin }) {
     }
   }
 
-  return (
-    <>
-      <header>
-        <h1>AIGate <span>控制台</span></h1>
-        <div className="cred"><span className={pillClass}>{pill}</span></div>
-      </header>
-      <main className="gate">
-        {message ? <p className={message.kind}>{message.text}</p> : null}
-        {screen === "register" ? (
-          <>
-            <form className="grid" onSubmit={register}>
-              <label>用户名<input value={username} placeholder="用户名" onChange={(e) => setUsername(e.target.value)} /></label>
-              <label>密码<input type="password" value={password} placeholder="至少 8 个字符" onChange={(e) => setPassword(e.target.value)} /></label>
-              <button type="submit">注册</button>
-            </form>
-            <p className="gate-switch">已有账号？<button type="button" className="link" onClick={openLogin}>去登录</button></p>
-          </>
-        ) : (
-          <>
-            <form className="grid" onSubmit={login}>
-              <label>用户名<input value={loginUser} placeholder="用户名" onChange={(e) => setLoginUser(e.target.value)} /></label>
-              <label>密码<input type="password" value={loginPassword} placeholder="密码" onChange={(e) => setLoginPassword(e.target.value)} /></label>
-              <button type="submit">登录</button>
-            </form>
-            <p className="gate-switch">没有账号？<button type="button" className="link" onClick={openRegister}>去注册</button></p>
-          </>
-        )}
-      </main>
-    </>
-  );
+  const registering = screen === "register";
+  return <div className="auth-shell">
+    <header className="auth-topbar"><Brand/><span className={pillClass}>{pill}</span></header>
+    <main className="gate">
+      <section className="auth-card">
+        <div className="auth-heading"><span className="eyebrow">LOCAL AI GATEWAY</span><h1>{registering ? "创建控制台账号" : "欢迎回来"}</h1><p>{registering ? "注册一个本地账号，开始管理你的模型网关。" : "登录以管理模型、路由和访问凭证。"}</p></div>
+        {message ? <p className={message.kind} role={message.kind === "error" ? "alert" : "status"}>{message.text}</p> : null}
+        <form className="auth-form" onSubmit={registering ? register : login}>
+          <label>用户名<input autoComplete="username" value={registering ? username : loginUser} placeholder="请输入用户名" onChange={(e) => registering ? setUsername(e.target.value) : setLoginUser(e.target.value)} required/></label>
+          <label>密码<input type="password" autoComplete={registering ? "new-password" : "current-password"} value={registering ? password : loginPassword} placeholder={registering ? "至少 8 个字符" : "请输入密码"} onChange={(e) => registering ? setPassword(e.target.value) : setLoginPassword(e.target.value)} required/></label>
+          <button type="submit" className="auth-submit">{registering ? "注册账号" : "登录控制台"}</button>
+        </form>
+        <p className="gate-switch">{registering ? "已有账号？" : "没有账号？"}<button type="button" className="link" onClick={registering ? openLogin : openRegister}>{registering ? "返回登录" : "创建账号"}</button></p>
+      </section>
+      <p className="auth-footnote">AIGate · 让每一次模型调用清晰可控</p>
+    </main>
+  </div>;
 }

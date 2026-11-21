@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuangjm123/aiconv"
 
+	"github.com/kuangjm123/AIGate/internal/login"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -141,6 +142,9 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		}
 		writeProtocolError(w, proto, status, code, message)
 		return status
+	}
+	if _, _, ok := login.ParseID(parsed.Model); ok {
+		return s.serveLogin(w, r, snap, proto, parsed, accepted, call, told, ancillary, meta)
 	}
 	route, ids := candidates(snap.Config, parsed.Model)
 	if hasMedia(accepted) {

@@ -23,7 +23,7 @@ func IsModelPath(path string) bool {
 // IsConsolePath reports a control route. The gateway rejects these and does not apply them.
 func IsConsolePath(path string) bool {
 	switch path {
-	case "/", "/config-status", "/register", "/login", "/logout", "/providers", "/routes", "/plugins", "/plugins/order", "/tokens", "/usage", "/listeners", "/conversations", "/conversations/turns", "/agents":
+	case "/", "/config-status", "/register", "/login", "/logout", "/providers", "/routes", "/plugins", "/plugins/order", "/tokens", "/usage", "/listeners", "/conversations", "/conversations/turns", "/agents", "/accounts", "/accounts/discovery", "/accounts/workbuddy":
 		return true
 	}
 	if rest, ok := strings.CutPrefix(path, "/agents/"); ok && rest != "" {

@@ -8,7 +8,7 @@ A second connect keeps the first note. Reconnect rewrites the gateway values and
 
 The value written as the key is `aigate-<id>`. It is the local caller name, not an upstream provider key. On a loopback peer it is accepted and stored as the caller. A remote peer, or a request with `X-Forwarded-For` or `Forwarded`, is `auth_failure` unless the credential is an issued gateway token. `magpie` and `magpie-<name>` are still caller names.
 
-Connect refuses, and writes nothing, when the gateway is not listening (`not_listening`), when there is no conversation model to offer (`no_models`), when the agent is not installed (`absent`), or when the file is not one this process can edit without dropping other values (`unknown`). A hidden, image, or video model is not offered. A route name is offered as itself. A provider model is offered as `providerId/model`.
+Connect refuses, and writes nothing, when the gateway is not listening (`not_listening`), when there is no conversation model to offer (`no_models`), when the agent is not installed (`absent`), or when the file is not one this process can edit without dropping other values (`unknown`). A hidden, image, or video model is not offered. A route name is offered as itself. A provider model is offered as `providerId/model`. A subscription model is offered as `login/<account>/<model>` from [accounts](accounts.md). The sign-in itself is not copied into the agent config.
 
 Cursor is detected and not edited. Its state is `manual`.
 

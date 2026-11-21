@@ -85,7 +85,7 @@ func (s *Server) changeAgent(w http.ResponseWriter, id string, connect bool) int
 	}
 	gw := agent.Target{Origin: s.gatewayOrigin()}
 	if connect {
-		err = agent.Connect(m, id, gw, agent.Offers(snap.Config))
+		err = agent.Connect(m, id, gw, s.offerModels(snap.Config))
 	} else {
 		err = agent.Disconnect(m, id)
 	}

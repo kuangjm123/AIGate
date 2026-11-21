@@ -29,6 +29,7 @@ func main() {
 	}
 	store := state.Open(paths)
 	application := app.New(store, logger)
+	application.EnableAccounts()
 	if err := application.Start(); err != nil {
 		logger.Fatalf("start failed: %v", err)
 	}
