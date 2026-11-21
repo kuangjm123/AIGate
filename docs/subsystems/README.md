@@ -2,9 +2,19 @@
 
 These pages describe current responsibilities, runtime paths, state, and contracts. Start with the subsystem relevant to your task, then follow its source links to verify the implementation you change.
 
-Nothing is listed yet. This repository has no implementation, so there is no reference beside this page and no source to verify. The [README](../../README.md) states the product. It does not name subsystems, and it is not permission to add pages for provider migration, plugin hosting, auth, usage, or routing.
+The [README](../../README.md) states the product. It does not name subsystems, and it is not permission to add a page for behavior the source does not have yet. A proposal stays in [design](../design/README.md).
 
-Add a row only when a reference describes behavior that source in this repository already has, and the page links to that source. Until the first such page exists, this index has no table. A proposal for behavior that does not exist yet is written in [design](../design/README.md), not on this index.
+| Page | What the source does now |
+| --- | --- |
+| [Ports](ports.md) | One process, two listeners, and how a config write reaches the gateway |
+| [State](state.md) | Config file, usage store, snapshot, and a failed read |
+| [Gateway](gateway.md) | Token check, the attempt loop, and the closed no-dialect path |
+| [Console](console.md) | The control page and the JSON API on the console port |
+| [Security](security.md) | Bind addresses, secret masking, and provider base URLs |
+| [Agent wiring](agent-wiring.md) | Detect a local coding agent, point its config at the gateway, and put the previous values back |
+| [Accounts](accounts.md) | Read a local subscription sign-in as a provider without copying the credential |
+
+Add a row only in the same change that adds the source the page describes.
 
 A subsystem can span several packages or repositories. Its reference describes the behavior those parts provide together; it does not need to list every function.
 
@@ -24,7 +34,7 @@ Name the input and the condition that trigger the change, the behavior a caller 
 
 This is an author-provided explanation that a reviewer verifies against the diff and surrounding code. It is not an automatically proven compatibility verdict.
 
-With no subsystem listed, a PR has no reference to update. Say that, and do not describe planned behavior as current.
+When no row matches the change, the change is adding a subsystem: the reference and the source arrive together, or the PR stops. Do not describe planned behavior as current.
 
 ## Review a change
 
