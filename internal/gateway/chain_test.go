@@ -116,6 +116,10 @@ func TestUnavailableFallsThroughAndAuthDoesNot(t *testing.T) {
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "second") || first.Load() != 1 || second.Load() != 1 {
 		t.Fatalf("fallback %d %s hits %d %d", rr.Code, rr.Body.String(), first.Load(), second.Load())
 	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 2 || recs[0].Status != http.StatusServiceUnavailable || recs[1].Status != http.StatusOK || recs[1].Outcome != OutcomeSuccess {
+		t.Fatalf("fallback usage %+v %v", recs, err)
+	}
 
 	var blocked atomic.Int32
 	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +138,37 @@ func TestUnavailableFallsThroughAndAuthDoesNot(t *testing.T) {
 	rr = callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
 	if rr.Code != http.StatusUnauthorized || !strings.Contains(rr.Body.String(), "auth_failure") || blocked.Load() != 0 {
 		t.Fatalf("auth stop %d %s blocked %d", rr.Code, rr.Body.String(), blocked.Load())
+	}
+	deniedRecs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(deniedRecs) != 1 || deniedRecs[0].Outcome != string(state.ClassAuthFailure) || deniedRecs[0].Status != http.StatusUnauthorized {
+		t.Fatalf("auth usage %+v %v", deniedRecs, err)
+	}
+}
+
+func TestUsageLineStoresCounts(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":1}}}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	rr := callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reply %d %s", rr.Code, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("usage %v %v", recs, err)
+	}
+	got := recs[0].Counts()
+	if recs[0].Status != http.StatusOK || got.In != 6 || got.Out != 3 || got.CacheRead != 4 || got.CacheWrite != 0 || got.Reasoning != 1 {
+		t.Fatalf("line %+v counts %+v", recs[0], got)
+	}
+	b, err := json.Marshal(recs[0])
+	if err != nil || !bytes.Contains(b, []byte(`"cacheWrite":0`)) {
+		t.Fatalf("zero cache write omitted: %s", b)
 	}
 }
 

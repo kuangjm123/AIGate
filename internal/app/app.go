@@ -19,6 +19,7 @@ import (
 	"github.com/kuangjm123/AIGate/internal/console"
 	"github.com/kuangjm123/AIGate/internal/gateway"
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/price"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -50,9 +51,10 @@ func New(store *state.Store, logger *log.Logger) *App {
 		logger = log.New(io.Discard, "", 0)
 	}
 	a := &App{store: store, log: logger}
-	a.gateway = &gateway.Server{Store: store, Log: logger}
+	book := price.NewBook()
+	a.gateway = &gateway.Server{Store: store, Log: logger, Prices: book}
 	a.console = &console.Server{
-		Store: store, Host: a, Log: logger,
+		Store: store, Host: a, Log: logger, Prices: book,
 		Probe: func(ctx context.Context, prov state.Provider, consoleListen string) console.ProbeResult {
 			got := a.gateway.Probe(ctx, prov, consoleListen)
 			return console.ProbeResult{OK: got.OK, Status: got.Status, Protocol: got.Protocol, Model: got.Model, Error: got.Error}

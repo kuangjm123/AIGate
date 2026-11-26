@@ -44,7 +44,7 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, snap *state.
 	discovered := login.Discover(s.loginMachine())
 	started := time.Now().UTC()
 	if discovered.Status == "unknown" {
-		s.note(snap, meta, "", "login/"+account, CodeUnknown, started, nil)
+		s.note(snap, meta, "", "login/"+account, CodeUnknown, 0, started, nil)
 		writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
 		return http.StatusBadGateway
 	}
@@ -64,25 +64,25 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, snap *state.
 		if found.Plugin {
 			code = "plugin"
 		}
-		s.note(snap, meta, "", "login/"+account, code, started, nil)
+		s.note(snap, meta, "", "login/"+account, code, 0, started, nil)
 		writeProtocolError(w, proto, http.StatusBadGateway, code, code)
 		return http.StatusBadGateway
 	}
 	dest := loginProtocol(account)
 	body, err := outboundBody(parsed, raw, dest, model)
 	if err != nil {
-		s.note(snap, meta, "", "login/"+account, "unsupported", started, nil)
+		s.note(snap, meta, "", "login/"+account, "unsupported", 0, started, nil)
 		writeProtocolError(w, proto, http.StatusBadGateway, "unsupported", "unsupported")
 		return http.StatusBadGateway
 	}
 	up, err := login.Dial(r.Context(), s.loginMachine(), account, model, body, parsed.Stream && account != "claude")
 	if errors.Is(err, login.ErrPlugin) {
-		s.note(snap, meta, "", "login/"+account, "plugin", started, nil)
+		s.note(snap, meta, "", "login/"+account, "plugin", 0, started, nil)
 		writeProtocolError(w, proto, http.StatusBadGateway, "plugin", "plugin")
 		return http.StatusBadGateway
 	}
 	if err != nil {
-		s.note(snap, meta, "", "login/"+account, string(state.ClassUpstreamUnavailable), started, nil)
+		s.note(snap, meta, "", "login/"+account, string(state.ClassUpstreamUnavailable), 0, started, nil)
 		writeProtocolError(w, proto, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), string(state.ClassUpstreamUnavailable))
 		return http.StatusBadGateway
 	}
@@ -95,7 +95,7 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, snap *state.
 	if status < 200 || status >= 300 {
 		outcome = string(state.ClassUpstreamUnavailable)
 	}
-	s.note(snap, meta, "", "login/"+account, outcome, started, usage)
+	s.note(snap, meta, "", "login/"+account, outcome, status, started, usage)
 	if s.Store != nil && complete && !ancillary && call.Session != "" && status >= 200 && status < 300 {
 		_ = s.Store.AppendTurn(state.TurnRecord{
 			Session: call.Session, At: time.Now().UTC(), Model: meta.Model, Caller: meta.Caller,

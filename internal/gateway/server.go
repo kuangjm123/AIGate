@@ -8,6 +8,7 @@ import (
 
 	"github.com/kuangjm123/AIGate/internal/console"
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/price"
 	"github.com/kuangjm123/AIGate/internal/respond"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
@@ -27,6 +28,8 @@ type Server struct {
 	sticky        map[string]string
 	// Login reads subscription sign-ins for catalog and dial. Nil reads none.
 	Login func() login.Machine
+	// Prices reads list prices for a gateway token's spend cap. Nil prices nothing.
+	Prices price.Pricer
 }
 
 // ServeHTTP rejects console routes, requires a gateway token, then serves a

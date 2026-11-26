@@ -14,7 +14,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/kuangjm123/AIGate/internal/agent"
+	"github.com/kuangjm123/AIGate/internal/balance"
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/price"
 	"github.com/kuangjm123/AIGate/internal/respond"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
@@ -69,6 +71,8 @@ type Server struct {
 	Agents *agent.Machine
 	// Logins, when set, reads subscription sign-ins. Nil reads none.
 	Logins func() login.Machine
+	// Prices reads list prices for the usage summary. Nil leaves every priced call unpriced.
+	Prices price.Pricer
 }
 
 // ModelReport is one model checked with a short request.
@@ -836,24 +840,28 @@ func (s *Server) reorderPlugins(w http.ResponseWriter, r *http.Request) int {
 }
 
 type tokenView struct {
-	ID      string   `json:"id"`
-	Mask    string   `json:"mask"`
-	Revoked bool     `json:"revoked"`
-	Models  []string `json:"models,omitempty"`
+	ID          string   `json:"id"`
+	Mask        string   `json:"mask"`
+	Revoked     bool     `json:"revoked"`
+	Models      []string `json:"models,omitempty"`
+	SpendLimit  *float64 `json:"spendLimit,omitempty"`
+	SpendPeriod string   `json:"spendPeriod,omitempty"`
 }
 
 type tokenCreated struct {
-	ID      string `json:"id"`
-	Secret  string `json:"secret"`
-	Mask    string `json:"mask"`
-	Revoked bool   `json:"revoked"`
+	ID          string   `json:"id"`
+	Secret      string   `json:"secret"`
+	Mask        string   `json:"mask"`
+	Revoked     bool     `json:"revoked"`
+	SpendLimit  *float64 `json:"spendLimit,omitempty"`
+	SpendPeriod string   `json:"spendPeriod,omitempty"`
 }
 
 func (s *Server) listTokens(w http.ResponseWriter) int {
 	snap := s.Store.Current()
 	out := make([]tokenView, len(snap.Config.GatewayTokens))
 	for i, t := range snap.Config.GatewayTokens {
-		out[i] = tokenView{ID: t.ID, Mask: security.Mask(t.Secret), Revoked: t.Revoked, Models: t.Models}
+		out[i] = tokenView{ID: t.ID, Mask: security.Mask(t.Secret), Revoked: t.Revoked, Models: t.Models, SpendLimit: t.SpendLimit, SpendPeriod: t.SpendPeriod}
 	}
 	respond.JSON(w, http.StatusOK, out)
 	return http.StatusOK
@@ -861,7 +869,9 @@ func (s *Server) listTokens(w http.ResponseWriter) int {
 
 func (s *Server) createToken(w http.ResponseWriter, r *http.Request) int {
 	var in struct {
-		Models []string `json:"models"`
+		Models      []string `json:"models"`
+		SpendLimit  *float64 `json:"spendLimit"`
+		SpendPeriod string   `json:"spendPeriod"`
 	}
 	if r.Body != nil {
 		raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -882,8 +892,12 @@ func (s *Server) createToken(w http.ResponseWriter, r *http.Request) int {
 		if err != nil {
 			return err
 		}
-		cfg.GatewayTokens = append(cfg.GatewayTokens, state.GatewayToken{ID: id, Secret: secret, Models: in.Models})
-		created = tokenCreated{ID: id, Secret: secret, Mask: security.Mask(secret)}
+		token := state.GatewayToken{ID: id, Secret: secret, Models: in.Models, SpendLimit: in.SpendLimit, SpendPeriod: in.SpendPeriod}
+		if token.SpendLimit != nil && token.SpendPeriod == "" {
+			token.SpendPeriod = "30d"
+		}
+		cfg.GatewayTokens = append(cfg.GatewayTokens, token)
+		created = tokenCreated{ID: id, Secret: secret, Mask: security.Mask(secret), SpendLimit: token.SpendLimit, SpendPeriod: token.SpendPeriod}
 		return nil
 	})
 	if err != nil {
@@ -929,6 +943,16 @@ func (s *Server) listUsage(w http.ResponseWriter, r *http.Request) int {
 	if err != nil {
 		return badJSON(w)
 	}
+	period := q.Get("period")
+	if period != "" {
+		start, ok := state.PeriodStart(period, time.Now())
+		if !ok {
+			return badJSON(w)
+		}
+		if !start.IsZero() && (filter.Start == nil || filter.Start.Before(start)) {
+			filter.Start = &start
+		}
+	}
 	recs, err := s.Store.ReadUsage(filter)
 	if errors.Is(err, state.ErrUsageUnknown) {
 		respond.JSON(w, http.StatusOK, map[string]string{"status": "unknown"})
@@ -938,8 +962,41 @@ func (s *Server) listUsage(w http.ResponseWriter, r *http.Request) int {
 		respond.JSON(w, http.StatusOK, map[string]string{"status": "unknown"})
 		return http.StatusOK
 	}
-	respond.JSON(w, http.StatusOK, map[string]any{"status": "ok", "records": recs})
+	sum := state.SummarizeUsage(recs)
+	sum.Cost, sum.Unpriced = price.Tally(recs, func(model string) (price.Rate, bool) {
+		if s.Prices == nil {
+			return price.Rate{}, false
+		}
+		return s.Prices.Rate(r.Context(), model)
+	})
+	body := map[string]any{
+		"status":   "ok",
+		"records":  recs,
+		"summary":  sum,
+		"balances": s.providerBalances(r.Context()),
+		"quotas":   s.subscriptionQuotas(r.Context()),
+	}
+	if period != "" {
+		body["period"] = period
+	}
+	respond.JSON(w, http.StatusOK, body)
 	return http.StatusOK
+}
+
+func (s *Server) providerBalances(ctx context.Context) []balance.Reading {
+	if s == nil || s.Store == nil || s.Store.Current() == nil {
+		return []balance.Reading{}
+	}
+	return balance.ForProviders(ctx, nil, s.Store.Current().Config.Providers, "")
+}
+
+// subscriptionQuotas asks each readable subscription sign-in for its remaining
+// allowance. Nil Logins reads none. A failed read is unknown, never zero.
+func (s *Server) subscriptionQuotas(ctx context.Context) []login.Quota {
+	if s == nil || s.Logins == nil {
+		return []login.Quota{}
+	}
+	return login.Usage(ctx, s.Logins())
 }
 
 func (s *Server) listConversations(w http.ResponseWriter) int {

@@ -143,6 +143,10 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		writeProtocolError(w, proto, status, code, message)
 		return status
 	}
+	if code, status := s.spendBlock(r.Context(), admitted); code != "" {
+		writeProtocolError(w, proto, status, code, code)
+		return status
+	}
 	if _, _, ok := login.ParseID(parsed.Model); ok {
 		return s.serveLogin(w, r, snap, proto, parsed, accepted, call, told, ancillary, meta)
 	}
@@ -174,24 +178,24 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		started := time.Now().UTC()
 		prov, pok := snap.Config.Provider(providerID)
 		if !pok {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, started, nil)
+			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
 			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
 			return http.StatusBadGateway
 		}
 		dest, known := providerProtocol(prov.Protocol, proto)
 		if !known || len(prov.Keys()) == 0 {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, started, nil)
+			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
 			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
 			return http.StatusBadGateway
 		}
 		switch security.CheckBaseURL(prov.BaseURL, s.consoleAddr(), "") {
 		case security.BaseOK:
 		case security.BaseUnknown:
-			s.note(snap, meta, route.id, providerID, CodeUnknown, started, nil)
+			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
 			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
 			return http.StatusBadGateway
 		default:
-			s.note(snap, meta, route.id, providerID, CodeBaseURL, started, nil)
+			s.note(snap, meta, route.id, providerID, CodeBaseURL, 0, started, nil)
 			writeProtocolError(w, proto, http.StatusBadGateway, CodeBaseURL, CodeBaseURL)
 			return http.StatusBadGateway
 		}
@@ -205,12 +209,12 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		}
 		up, err := s.postProvider(r.Context(), prov, dest, upModel, parsed.Stream, outbound)
 		if err != nil && r.Context().Err() != nil {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, started, nil)
+			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
 			return last.statusOr(http.StatusBadGateway)
 		}
 		dialed = true
 		if err != nil {
-			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, string(state.ClassUpstreamUnavailable), started, nil)
+			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, string(state.ClassUpstreamUnavailable), 0, started, nil)
 			if last.stopped {
 				return last.status
 			}
@@ -223,11 +227,11 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			usage := usageObject(dest, limited)
 			class := outcome
 			if class == "" {
-				s.note(snap, meta, route.id, providerID, "http_"+itoa(up.StatusCode), started, usage)
+				s.note(snap, meta, route.id, providerID, "http_"+itoa(up.StatusCode), up.StatusCode, started, usage)
 				writeUpstreamOrError(w, proto, up.StatusCode, limited)
 				return up.StatusCode
 			}
-			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, class, started, usage)
+			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, class, up.StatusCode, started, usage)
 			if last.stopped {
 				return last.status
 			}
@@ -239,7 +243,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		if status < 200 || status >= 300 {
 			outcome = string(state.ClassUpstreamUnavailable)
 		}
-		s.note(snap, meta, route.id, providerID, outcome, started, usage)
+		s.note(snap, meta, route.id, providerID, outcome, status, started, usage)
 		if s.Store != nil && complete && !ancillary && call.Session != "" && status >= 200 && status < 300 {
 			_ = s.Store.AppendTurn(state.TurnRecord{
 				Session:    call.Session,
@@ -304,7 +308,7 @@ type attemptMeta struct {
 	Protocol string
 }
 
-func (s *Server) note(snap *state.Snapshot, meta attemptMeta, routeID, providerID, outcome string, started time.Time, usage json.RawMessage) {
+func (s *Server) note(snap *state.Snapshot, meta attemptMeta, routeID, providerID, outcome string, status int, started time.Time, usage json.RawMessage) {
 	if s == nil || s.Store == nil {
 		return
 	}
@@ -312,6 +316,7 @@ func (s *Server) note(snap *state.Snapshot, meta attemptMeta, routeID, providerI
 		RouteID:    routeID,
 		ProviderID: providerID,
 		Outcome:    outcome,
+		Status:     status,
 		Started:    started,
 		Finished:   time.Now().UTC(),
 		Usage:      cloneRaw(usage),
@@ -335,8 +340,8 @@ func (c codeResult) statusOr(fallback int) int {
 	return c.status
 }
 
-func (s *Server) fail(w http.ResponseWriter, snap *state.Snapshot, proto Protocol, allows func(string) bool, meta attemptMeta, routeID, providerID, class string, started time.Time, usage json.RawMessage) codeResult {
-	s.note(snap, meta, routeID, providerID, class, started, usage)
+func (s *Server) fail(w http.ResponseWriter, snap *state.Snapshot, proto Protocol, allows func(string) bool, meta attemptMeta, routeID, providerID, class string, status int, started time.Time, usage json.RawMessage) codeResult {
+	s.note(snap, meta, routeID, providerID, class, status, started, usage)
 	if allows != nil && allows(class) {
 		return codeResult{status: statusFor(class)}
 	}

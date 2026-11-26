@@ -34,6 +34,10 @@ const (
 	CodeBaseURL = "base_url"
 	// CodeUnknown means the attempt could not be classified.
 	CodeUnknown = "unknown"
+	// CodeSpendLimit means this gateway token has reached its dollar cap.
+	CodeSpendLimit = "spend_limit"
+	// CodePriceUnknown means the token has a cap and the price list could not be read.
+	CodePriceUnknown = "price_unknown"
 	// OutcomeSuccess is the usage outcome of a completed reply.
 	OutcomeSuccess = "success"
 )
@@ -144,7 +148,7 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 		prov, pok := snap.Config.Provider(providerID)
 		if !pok {
 			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, 0, started, nil), nil)
 			return res, nil
 		}
 		fields := Fields{Model: model}
@@ -162,7 +166,7 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 		}
 		if reject != "" {
 			res := Result{Code: reject, Status: statusFor(reject)}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, reject, started, nil), nil)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, reject, 0, started, nil), nil)
 			if route.Allows(state.ErrorClass(reject)) {
 				last = res
 				continue
@@ -173,11 +177,11 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 		case security.BaseOK:
 		case security.BaseUnknown:
 			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, 0, started, nil), nil)
 			return res, nil
 		default:
 			res := Result{Code: CodeBaseURL, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeBaseURL, started, nil), nil)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeBaseURL, 0, started, nil), nil)
 			return res, nil
 		}
 		resp, err := dialer.Dial(ctx, DialRequest{
@@ -189,7 +193,7 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 		})
 		if err != nil && ctx.Err() != nil {
 			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, 0, started, nil), nil)
 			return res, ctx.Err()
 		}
 		if err != nil {
@@ -202,7 +206,7 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 				status = http.StatusOK
 			}
 			res := Result{Status: status, Body: body}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, OutcomeSuccess, started, cloneRaw(resp.Usage)), body)
+			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, OutcomeSuccess, status, started, cloneRaw(resp.Usage)), body)
 			return res, nil
 		}
 		class := resp.Class
@@ -210,7 +214,7 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 			class = string(state.ClassUpstreamUnavailable)
 		}
 		res := Result{Code: class, Status: statusFor(class)}
-		res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, class, started, cloneRaw(resp.Usage)), nil)
+		res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, class, resp.Status, started, cloneRaw(resp.Usage)), nil)
 		if route.Allows(state.ErrorClass(class)) {
 			last = res
 			continue
@@ -223,11 +227,12 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 	return last, nil
 }
 
-func record(routeID, providerID, outcome string, started time.Time, usage json.RawMessage) state.AttemptRecord {
+func record(routeID, providerID, outcome string, status int, started time.Time, usage json.RawMessage) state.AttemptRecord {
 	return state.AttemptRecord{
 		RouteID:    routeID,
 		ProviderID: providerID,
 		Outcome:    outcome,
+		Status:     status,
 		Started:    started,
 		Finished:   time.Now().UTC(),
 		Usage:      usage,

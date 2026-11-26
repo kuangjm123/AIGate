@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/price"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -140,6 +141,142 @@ func TestUsageReadDoesNotAppend(t *testing.T) {
 	after := mustGET(t, srv.URL+"/usage", token)
 	if before != after {
 		t.Fatal("console appended usage")
+	}
+}
+
+func TestTokenSpendLimitIsStored(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	created := postJSON(t, srv.URL+"/tokens", token, map[string]any{"spendLimit": 2.5, "spendPeriod": "today"})
+	if created["spendPeriod"] != "today" || created["spendLimit"] != 2.5 {
+		t.Fatalf("created %#v", created)
+	}
+	listed := mustGET(t, srv.URL+"/tokens", token)
+	if !strings.Contains(listed, `"spendLimit":2.5`) || !strings.Contains(listed, `"spendPeriod":"today"`) {
+		t.Fatalf("list %s", listed)
+	}
+	res, body := do(t, http.MethodPost, srv.URL+"/tokens", token, []byte(`{"spendLimit":-1}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "spend_limit") {
+		t.Fatalf("negative %d %s", res.StatusCode, body)
+	}
+}
+
+func TestUsageSummaryPricesTheWindow(t *testing.T) {
+	store := loadTemp(t)
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "r", ProviderID: "p", Outcome: "success", Model: "demo",
+		Started: time.Now().UTC(), Finished: time.Now().UTC(),
+		Usage: json.RawMessage(`{"prompt_tokens":1000000,"completion_tokens":500000}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{
+		Store: store, Host: memHost{store: store},
+		Prices: price.Fixed{"demo": {Input: 2, Output: 8}},
+	})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage?period=all", token)
+	if !strings.Contains(body, `"cost":6`) || !strings.Contains(body, `"unpriced":0`) {
+		t.Fatalf("priced %s", body)
+	}
+}
+
+func TestUsageBalanceDoesNotDialAnUnknownHost(t *testing.T) {
+	store := loadTemp(t)
+	key := "sk-test-secret"
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{
+			ID: "p", Name: "OpenAI", Protocol: "chat", BaseURL: "https://api.openai.com/v1",
+			Models: []string{"gpt-4o"}, Credential: key,
+		}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", session)
+	if strings.Contains(body, key) || !strings.Contains(body, `"providerId":"p"`) || !strings.Contains(body, `"status":"unsupported"`) || strings.Contains(body, `"remaining"`) {
+		t.Fatalf("balance %s", body)
+	}
+}
+
+func TestUsageQuotasReadTheSubscriptionSignIns(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := "secret-token"
+	if err := os.WriteFile(filepath.Join(home, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"`+secret+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Logins: func() login.Machine {
+		return login.Machine{Home: home, ClaudeUsage: func(context.Context, string) ([]byte, error) {
+			return []byte("Current session: 13% used\nResets 4pm\n"), nil
+		}}
+	}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(body, `"quotas":[{"account":"claude"`) || !strings.Contains(body, `"usedPercent":13`) || !strings.Contains(body, `"resetText":"4pm"`) {
+		t.Fatalf("quotas %s", body)
+	}
+	if strings.Contains(body, secret) {
+		t.Fatal("usage response contains the token")
+	}
+}
+
+func TestUsageQuotasWithoutLoginsIsEmpty(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(body, `"quotas":[]`) {
+		t.Fatalf("quotas %s", body)
+	}
+}
+
+func TestUsageSummaryUsesLocalToday(t *testing.T) {
+	store := loadTemp(t)
+	now := time.Now()
+	start, ok := state.PeriodStart("today", now)
+	if !ok {
+		t.Fatal("today")
+	}
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "old", ProviderID: "p", Outcome: "success",
+		Started: start.Add(-time.Minute), Finished: start,
+		Usage: json.RawMessage(`{"prompt_tokens":100,"completion_tokens":1}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "new", ProviderID: "p", Outcome: "success",
+		Started: start, Finished: start.Add(time.Second),
+		Usage: json.RawMessage(`{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4}}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage?period=today", token)
+	if strings.Contains(body, `"routeId":"old"`) || !strings.Contains(body, `"routeId":"new"`) || !strings.Contains(body, `"calls":1`) || !strings.Contains(body, `"in":6`) || !strings.Contains(body, `"cacheRead":4`) {
+		t.Fatalf("today %s", body)
+	}
+	res, bad := do(t, http.MethodGet, srv.URL+"/usage?period=year", token, nil)
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(bad, "invalid") {
+		t.Fatalf("bad period %d %s", res.StatusCode, bad)
+	}
+	allBody := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(allBody, `"summary"`) || !strings.Contains(allBody, `"calls":2`) {
+		t.Fatalf("all %s", allBody)
 	}
 }
 

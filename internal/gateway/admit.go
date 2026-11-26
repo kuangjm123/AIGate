@@ -15,9 +15,12 @@ import (
 // except the local magpie, magpie-<name>, aigate, and aigate-<name> keys,
 // which are application names.
 type admission struct {
-	caller  string
-	tokenID string
-	allow   []string
+	caller      string
+	tokenID     string
+	allow       []string
+	spendSet    bool
+	spendLimit  float64
+	spendPeriod string
 }
 
 func admit(r *http.Request, cfg state.Config) (admission, bool) {
@@ -25,7 +28,13 @@ func admit(r *http.Request, cfg state.Config) (admission, bool) {
 	if id, ok := cfg.TokenID(secret); ok {
 		token, _ := cfg.TokenByID(id)
 		allow := append([]string(nil), token.Models...)
-		return admission{caller: id, tokenID: id, allow: allow}, true
+		got := admission{caller: id, tokenID: id, allow: allow}
+		if token.SpendLimit != nil {
+			got.spendSet = true
+			got.spendLimit = *token.SpendLimit
+			got.spendPeriod = token.SpendPeriod
+		}
+		return got, true
 	}
 	if requestOrigin(r) != "local" || secret == "" {
 		return admission{}, false

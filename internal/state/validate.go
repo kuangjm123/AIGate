@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"math"
 	"net"
 	"strings"
 
@@ -151,6 +152,17 @@ func validateTokens(cfg Config) error {
 			if strings.TrimSpace(model) == "" {
 				return invalid("model")
 			}
+		}
+		if t.SpendLimit != nil && (*t.SpendLimit < 0 || math.IsNaN(*t.SpendLimit) || math.IsInf(*t.SpendLimit, 0)) {
+			return invalid("spend_limit")
+		}
+		switch t.SpendPeriod {
+		case "", "today", "7d", "30d", "all":
+		default:
+			return invalid("spend_limit")
+		}
+		if t.SpendPeriod != "" && t.SpendLimit == nil {
+			return invalid("spend_limit")
 		}
 	}
 	return nil

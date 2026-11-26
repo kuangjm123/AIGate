@@ -172,11 +172,15 @@ type Plugin struct {
 
 // GatewayToken is a caller credential. Secret is stored in the file.
 // Models, when non-empty, is the only set of catalog ids this token may see or call.
+// SpendLimit, when set, is the most this token may cost in SpendPeriod, in US dollars.
+// SpendPeriod is today, 7d, 30d, or all. A limit with an empty period uses 30d.
 type GatewayToken struct {
-	ID      string   `json:"id"`
-	Secret  string   `json:"secret"`
-	Revoked bool     `json:"revoked,omitempty"`
-	Models  []string `json:"models,omitempty"`
+	ID          string   `json:"id"`
+	Secret      string   `json:"secret"`
+	Revoked     bool     `json:"revoked,omitempty"`
+	Models      []string `json:"models,omitempty"`
+	SpendLimit  *float64 `json:"spendLimit,omitempty"`
+	SpendPeriod string   `json:"spendPeriod,omitempty"`
 }
 
 // Session is one console login. SecretHash is stored; the secret is not.
