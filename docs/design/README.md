@@ -8,6 +8,9 @@ These pages record decisions this repository has not implemented. A [subsystem r
 | [Gateway](gateway.md) | How a plugin is loaded |
 | [State](state.md) | Encryption of the config file at rest |
 | [Security](security.md) | Nothing of the non-loopback gateway confirmation is still open |
+| [Usage ledger](usage-ledger.md) | Disk block cache, provider rename mapping, cache-hit/decode summaries, and OTLP export |
+| [Routing parity](routing-parity.md) | Intent rules, slow start, per-request decision records, and a switchable strategy registry remain open; steps 1–5 are implemented |
+| [Routing strategies](routing-strategies.md) | Per-request exact key promotion for `Exact` pools remains open; the strategy algorithms are implemented |
 
 Commands for the module are in [AGENTS.md](../../AGENTS.md).
 

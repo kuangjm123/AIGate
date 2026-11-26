@@ -17,10 +17,12 @@ import (
 type admission struct {
 	caller      string
 	tokenID     string
+	issuerID    string
 	allow       []string
 	spendSet    bool
 	spendLimit  float64
 	spendPeriod string
+	limits      []state.TokenLimit
 }
 
 func admit(r *http.Request, cfg state.Config) (admission, bool) {
@@ -29,11 +31,13 @@ func admit(r *http.Request, cfg state.Config) (admission, bool) {
 		token, _ := cfg.TokenByID(id)
 		allow := append([]string(nil), token.Models...)
 		got := admission{caller: id, tokenID: id, allow: allow}
-		if token.SpendLimit != nil {
+		if token.SpendLimit != nil && *token.SpendLimit > 0 {
 			got.spendSet = true
 			got.spendLimit = *token.SpendLimit
 			got.spendPeriod = token.SpendPeriod
 		}
+		got.issuerID = token.IssuerID
+		got.limits = append([]state.TokenLimit(nil), token.Limits...)
 		return got, true
 	}
 	if requestOrigin(r) != "local" || secret == "" {

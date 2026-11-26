@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/state"
 )
 
 func TestClaudeSubscriptionReturnsTheToolToTheCaller(t *testing.T) {
@@ -34,5 +35,29 @@ func TestClaudeSubscriptionReturnsTheToolToTheCaller(t *testing.T) {
 	srv.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "bash") || strings.Contains(rr.Body.String(), secret) {
 		t.Fatalf("reply %d %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUnknownSubscriptionWritesALocalRejection(t *testing.T) {
+	store, token := dialStore(t, nil, nil)
+	srv := &Server{Store: store, Login: func() login.Machine {
+		return login.Machine{Home: t.TempDir()}
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"login/missing/claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+	srv.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNotFound || !strings.Contains(rr.Body.String(), CodeNoRoute) {
+		t.Fatalf("reply %d %s", rr.Code, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+	rec := recs[0]
+	if rec.RouteID == "" || rec.ProviderID != "login/missing" || rec.ProviderAccount != "missing" ||
+		rec.Model != "claude-sonnet-4-6" || rec.Outcome != CodeNoRoute ||
+		rec.Status != http.StatusNotFound || !rec.Rejected || !rec.Failed() {
+		t.Fatalf("usage %+v", rec)
 	}
 }

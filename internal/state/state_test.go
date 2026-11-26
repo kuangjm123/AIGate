@@ -260,6 +260,113 @@ func TestEligibleOmittedAndEmpty(t *testing.T) {
 	}
 }
 
+func TestRouteRoundTripsRoutingAndWeights(t *testing.T) {
+	var route Route
+	raw := `{"id":"r","modelMatch":"m","providerIds":["a","b"],"routing":"weight","weights":{"a":3,"b":1}}`
+	if err := json.Unmarshal([]byte(raw), &route); err != nil {
+		t.Fatal(err)
+	}
+	if route.Routing != "weight" || route.Weights["a"] != 3 || route.Weights["b"] != 1 {
+		t.Fatalf("route %+v", route)
+	}
+	b, err := json.Marshal(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"routing":"weight"`) || !strings.Contains(string(b), `"weights":{"a":3,"b":1}`) {
+		t.Fatalf("marshal = %s", b)
+	}
+	plain, err := json.Marshal(Route{ID: "r", ModelMatch: "m", ProviderIDs: []string{}})
+	if err != nil || strings.Contains(string(plain), "routing") || strings.Contains(string(plain), "weights") {
+		t.Fatalf("default route wrote strategy fields: %s %v", plain, err)
+	}
+}
+
+func TestUnknownRoutingAndBadWeightRejected(t *testing.T) {
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Routes = []Route{{ID: "r", ModelMatch: "m", ProviderIDs: []string{"a"}, Routing: "bogus"}}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("unknown routing err = %v", Validate(cfg))
+	}
+	cfg.Routes[0].Routing = "weight"
+	cfg.Routes[0].Weights = map[string]int{"other": 2}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("non-member weight err = %v", Validate(cfg))
+	}
+	cfg.Routes[0].Weights = map[string]int{"a": 2}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid weight err = %v", err)
+	}
+}
+
+func TestGroupRoundTripsAndResolvesMembers(t *testing.T) {
+	var group Group
+	raw := `{"id":"team","members":["a/m","inner"],"routing":"cheap","weights":{"a/m":2},"eligible":[]}`
+	if err := json.Unmarshal([]byte(raw), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.ID != "team" || len(group.Members) != 2 || group.Routing != "cheap" ||
+		group.Weights["a/m"] != 2 || !group.EligibleSet || len(group.Eligible) != 0 {
+		t.Fatalf("group %+v", group)
+	}
+	b, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"eligible":[]`) || !strings.Contains(string(b), `"weights":{"a/m":2}`) {
+		t.Fatalf("marshal = %s", b)
+	}
+
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Groups = []Group{
+		{ID: "team", Members: []string{"a/m", "inner"}},
+		{ID: "inner", Members: []string{"a/m"}},
+	}
+	if got, ok := cfg.GroupFor("group/team"); !ok || got.ID != "team" {
+		t.Fatalf("group alias %+v %v", got, ok)
+	}
+	if member, ok := cfg.ResolveGroupMember("inner"); !ok || !member.Nested || member.GroupID != "inner" {
+		t.Fatalf("nested member %+v %v", member, ok)
+	}
+	if member, ok := cfg.ResolveGroupMember("a/m"); !ok || member.ProviderID != "a" || member.Model != "m" {
+		t.Fatalf("provider member %+v %v", member, ok)
+	}
+}
+
+func TestGroupValidationRejectsBadMembersCyclesAndRouteOnlyStrategies(t *testing.T) {
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Groups = []Group{{ID: "g", Members: []string{"a/m"}, Routing: "cheap"}}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("group cheap err = %v", err)
+	}
+	cfg.Routes = []Route{{ID: "r", ModelMatch: "m", ProviderIDs: []string{"a"}, Routing: "cheap"}}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("route cheap err = %v", Validate(cfg))
+	}
+	cfg.Routes = nil
+	cfg.Groups[0].Members = []string{"missing/m"}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "group" {
+		t.Fatalf("missing member err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Members = []string{"g"}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "group" {
+		t.Fatalf("cycle err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Members = []string{"a/m"}
+	cfg.Groups[0].Weights = map[string]int{"other": 1}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("group weight err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Weights = nil
+	cfg.Groups = append(cfg.Groups, Group{ID: "g", Members: []string{"a/m"}})
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "duplicate_id" {
+		t.Fatalf("duplicate group err = %v", Validate(cfg))
+	}
+}
+
 func TestNegativeSpendLimitRejected(t *testing.T) {
 	cfg := emptyConfig()
 	neg := -1.0
@@ -541,6 +648,15 @@ func TestAttemptUsageOmitsMissingCounts(t *testing.T) {
 	}
 	if strings.Contains(string(b), "prompt_tokens") || strings.Contains(string(b), `"usage"`) {
 		t.Fatalf("missing usage stored as a value: %s", b)
+	}
+}
+
+func TestConfigCloneCopiesRouteWeights(t *testing.T) {
+	original := Config{Routes: []Route{{ID: "r", Weights: map[string]int{"p1": 2}}}}
+	cloned := original.Clone()
+	cloned.Routes[0].Weights["p1"] = 9
+	if original.Routes[0].Weights["p1"] != 2 {
+		t.Fatalf("clone shares route weights: %+v", original.Routes[0].Weights)
 	}
 }
 

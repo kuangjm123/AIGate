@@ -635,6 +635,11 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 			routed[route.ModelMatch] = true
 		}
 	}
+	for _, group := range cfg.Groups {
+		if group.ID != "" {
+			routed[group.ID] = true
+		}
+	}
 	seen := map[string]bool{}
 	var out []catalogEntry
 	add := func(entry catalogEntry) {
@@ -649,6 +654,12 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 		out = append(out, entry)
 	}
 	if kind == "chat" {
+		for _, group := range cfg.Groups {
+			if group.ID == "" {
+				continue
+			}
+			add(catalogEntry{ID: group.ID, Owner: group.ID, Bare: group.ID})
+		}
 		for _, route := range cfg.Routes {
 			owner := route.ID
 			if owner == "" {

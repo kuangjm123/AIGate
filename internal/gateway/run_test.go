@@ -46,10 +46,10 @@ func TestFallbackRules(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(res.Body) != "second" || len(calls) != 2 || len(recs) != 2 {
+		if string(res.Body) != "second" || len(calls) != 2 || len(recs) != 1 {
 			t.Fatalf("body=%s calls=%v recs=%d", res.Body, calls, len(recs))
 		}
-		if recs[0].ProviderID != "p1" || recs[0].RouteID != "r" {
+		if recs[0].ProviderID != "p2" || recs[0].RouteID == "" || recs[0].Model != "m" || recs[0].Tries != 2 {
 			t.Fatalf("record %+v", recs[0])
 		}
 	})
@@ -116,6 +116,138 @@ func TestFallbackRules(t *testing.T) {
 			t.Fatalf("body=%s calls=%v", res.Body, calls)
 		}
 	})
+}
+
+func TestRunRecordsTheModelSentToTheDialer(t *testing.T) {
+	var sent string
+	var recs []state.AttemptRecord
+	hook := &spyHook{model: "upstream-m"}
+	res, err := Run(context.Background(), twoProviderSnap("s"), "m", "127.0.0.1:8081", dialFunc(func(req DialRequest) (DialResponse, error) {
+		sent = req.Fields.Model
+		return DialResponse{Completed: true, Status: http.StatusOK, Body: []byte("ok")}, nil
+	}), []Hook{hook}, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Body) != "ok" || sent != "upstream-m" {
+		t.Fatalf("body=%s sent=%q", res.Body, sent)
+	}
+	if len(recs) != 1 || recs[0].Model != "upstream-m" {
+		t.Fatalf("records %+v", recs)
+	}
+}
+
+func TestRunCompletedNonSuccessStatusIsAFailure(t *testing.T) {
+	var recs []state.AttemptRecord
+	res, err := Run(context.Background(), twoProviderSnap("s"), "m", "127.0.0.1:8081", dialFunc(func(DialRequest) (DialResponse, error) {
+		return DialResponse{Completed: true, Status: http.StatusInternalServerError, Body: []byte("provider error")}, nil
+	}), nil, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != http.StatusInternalServerError || string(res.Body) != "provider error" || res.Code == "" {
+		t.Fatalf("result %+v", res)
+	}
+	if len(recs) != 1 || recs[0].Status != http.StatusInternalServerError || !recs[0].Failed() || recs[0].Outcome == OutcomeSuccess {
+		t.Fatalf("records %+v", recs)
+	}
+	summary := state.SummarizeUsage(recs)
+	if summary.Calls != 1 || summary.Failed != 1 {
+		t.Fatalf("summary %+v", summary)
+	}
+}
+
+func TestRunFailureKeepsTheDialerStatus(t *testing.T) {
+	snap := twoProviderSnap("s")
+	snap.Config.Routes[0].ProviderIDs = []string{"p1"}
+	var recs []state.AttemptRecord
+	res, err := Run(context.Background(), snap, "m", "127.0.0.1:8081", dialFunc(func(DialRequest) (DialResponse, error) {
+		return DialResponse{Class: string(state.ClassUpstreamUnavailable), Status: http.StatusGatewayTimeout}, nil
+	}), nil, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != http.StatusGatewayTimeout || len(recs) != 1 || recs[0].Status != http.StatusGatewayTimeout || !recs[0].Failed() {
+		t.Fatalf("result %+v records %+v", res, recs)
+	}
+}
+
+func TestRunBilledFailureThenSuccessWritesHandedOn(t *testing.T) {
+	snap := twoProviderSnap("s")
+	var recs []state.AttemptRecord
+	res, err := Run(context.Background(), snap, "m", "127.0.0.1:8081", dialFunc(func(req DialRequest) (DialResponse, error) {
+		if req.ProviderID == "p1" {
+			return DialResponse{
+				Class: string(state.ClassUpstreamUnavailable),
+				Usage: json.RawMessage(`{"prompt_tokens":10,"completion_tokens":3}`),
+			}, nil
+		}
+		return DialResponse{
+			Completed: true, Status: http.StatusOK, Body: []byte("second"),
+			Usage: json.RawMessage(`{"prompt_tokens":5,"completion_tokens":2}`),
+		}, nil
+	}), nil, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(res.Body) != "second" || len(recs) != 2 {
+		t.Fatalf("body=%s records=%+v", res.Body, recs)
+	}
+	if recs[0].RouteID == "" || recs[0].RouteID != recs[1].RouteID {
+		t.Fatalf("route ids %q %q", recs[0].RouteID, recs[1].RouteID)
+	}
+	if !recs[0].HandedOn || recs[0].Model != "m" || recs[0].ProviderID != "p1" {
+		t.Fatalf("handed on %+v", recs[0])
+	}
+	if recs[1].HandedOn || recs[1].Model != "m" || recs[1].ProviderID != "p2" || recs[1].Tries != 2 {
+		t.Fatalf("final %+v", recs[1])
+	}
+	summary := state.SummarizeUsage(recs)
+	if summary.Calls != 1 || summary.Failed != 0 || summary.In != 15 || summary.Out != 5 {
+		t.Fatalf("summary %+v", summary)
+	}
+}
+
+func TestRunLastBilledFailureIsTheFinalRow(t *testing.T) {
+	snap := twoProviderSnap("s")
+	snap.Config.Routes[0].ProviderIDs = []string{"p1"}
+	var recs []state.AttemptRecord
+	res, err := Run(context.Background(), snap, "m", "127.0.0.1:8081", dialFunc(func(DialRequest) (DialResponse, error) {
+		return DialResponse{
+			Class: string(state.ClassUpstreamUnavailable),
+			Usage: json.RawMessage(`{"prompt_tokens":10,"completion_tokens":3}`),
+		}, nil
+	}), nil, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != string(state.ClassUpstreamUnavailable) || res.Status != http.StatusBadGateway {
+		t.Fatalf("result %+v", res)
+	}
+	if len(recs) != 1 || recs[0].HandedOn || recs[0].Model != "m" || !recs[0].Failed() {
+		t.Fatalf("records %+v", recs)
+	}
+	if got := recs[0].Counts(); got.In != 10 || got.Out != 3 {
+		t.Fatalf("counts %+v", got)
+	}
+}
+
+func TestRunReturnsTheLastAllowedHookRejection(t *testing.T) {
+	var recs []state.AttemptRecord
+	hook := &spyHook{reject: string(state.ClassUpstreamUnavailable)}
+	res, err := Run(context.Background(), twoProviderSnap("s"), "m", "127.0.0.1:8081", dialFunc(func(DialRequest) (DialResponse, error) {
+		t.Fatal("dialed after hook rejection")
+		return DialResponse{}, nil
+	}), []Hook{hook}, collect(&recs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Code != string(state.ClassUpstreamUnavailable) || res.Status != http.StatusBadGateway {
+		t.Fatalf("result %+v", res)
+	}
+	if len(recs) != 1 || recs[0].ProviderID != "p2" || recs[0].Model != "m" || recs[0].Tries != 2 || !recs[0].Rejected {
+		t.Fatalf("records %+v", recs)
+	}
 }
 
 func TestUnknownModelDoesNotDial(t *testing.T) {
@@ -393,11 +525,15 @@ func twoProviderSnap(secret string) *state.Snapshot {
 type spyHook struct {
 	view   View
 	reject string
+	model  string
 	after  int
 }
 
 func (h *spyHook) BeforeDial(_ context.Context, view View, in Fields) (Fields, string) {
 	h.view = view
+	if h.model != "" {
+		in.Model = h.model
+	}
 	return in, h.reject
 }
 

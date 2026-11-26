@@ -71,7 +71,7 @@ npm run build
 
 ## 配置
 
-默认文件在用户配置目录的 `aigate/config.json`。Windows 上是 `%APPDATA%\aigate\config.json`。设置 `AIGATE_CONFIG` 时只用那个文件。用量在同目录的 `usage/attempts.jsonl`，结束的对话在 `usage/conversations/`。
+默认文件在用户配置目录的 `aigate/config.json`。Windows 上是 `%APPDATA%\aigate\config.json`。设置 `AIGATE_CONFIG` 时只用那个文件。用量在同目录的 `usage/attempts.jsonl`，结束的对话在 `usage/conversations/`。这份账现在能做的事见 [用量](docs/usage.md)。
 
 网关默认只听本机。给别的机器用时，在控制台打开共享，并把监听改成非环回地址。那些请求必须带发放的网关令牌。令牌可以限制可见和可调用的模型，明文只在创建时出现一次。控制台会话不能当作网关令牌。
 

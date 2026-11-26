@@ -23,13 +23,14 @@ type Snapshot struct {
 // Readers take mu only long enough to clone the snapshot.
 // Disk writes run without holding mu.
 type Store struct {
-	paths   Paths
-	mu      sync.RWMutex
-	writeMu sync.Mutex
-	usageMu sync.Mutex
-	convMu  sync.Mutex
-	snap    *Snapshot
-	hash    func([]byte) (string, error)
+	paths      Paths
+	mu         sync.RWMutex
+	writeMu    sync.Mutex
+	usageMu    sync.Mutex
+	usageIndex usageIndex
+	convMu     sync.Mutex
+	snap       *Snapshot
+	hash       func([]byte) (string, error)
 }
 
 // Open returns a store for paths. It does not read the file.

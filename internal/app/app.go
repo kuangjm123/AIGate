@@ -54,7 +54,8 @@ func New(store *state.Store, logger *log.Logger) *App {
 	book := price.NewBook()
 	a.gateway = &gateway.Server{Store: store, Log: logger, Prices: book}
 	a.console = &console.Server{
-		Store: store, Host: a, Log: logger, Prices: book,
+		Store: store, Host: a, Log: logger, Prices: book, Traffic: a.gateway.Traffic,
+		ResetSeat: a.gateway.ResetSeat,
 		Probe: func(ctx context.Context, prov state.Provider, consoleListen string) console.ProbeResult {
 			got := a.gateway.Probe(ctx, prov, consoleListen)
 			return console.ProbeResult{OK: got.OK, Status: got.Status, Protocol: got.Protocol, Model: got.Model, Error: got.Error}

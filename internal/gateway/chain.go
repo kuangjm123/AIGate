@@ -91,6 +91,8 @@ func (s *Server) consoleAddr() string {
 }
 
 func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.Snapshot, proto Protocol, admitted admission) int {
+	requestStart := time.Now().UTC()
+	requestID, _ := state.NewID()
 	body, tooBig := readBody(r.Body)
 	if tooBig {
 		writeProtocolError(w, proto, http.StatusRequestEntityTooLarge, "too_large", "too_large")
@@ -103,19 +105,49 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 	}
 	call := callContext(r, parsed)
 	ancillary := call.Kind == "title" || call.Kind == "summary" || call.Kind == "compact"
+	meta := attemptMeta{
+		Model: parsed.Model, Session: call.Session, TokenID: admitted.tokenID,
+		CallerKeyID: admitted.tokenID, CallerIssuerID: admitted.issuerID,
+		Caller: admitted.caller, Agent: call.Agent, Protocol: string(proto),
+	}
+	if meta.Agent == "" {
+		meta.Agent = admitted.caller
+	}
+	cancelBeforeRoute := func() int {
+		s.note(snap, meta, usageNote{
+			RouteID: requestID, Outcome: "canceled", Status: 499, Started: requestStart,
+			Err: state.CanceledText, ErrType: "agent_canceled",
+		})
+		return 499
+	}
 	accepted := append([]byte(nil), parsed.Raw...)
 	var told []RequestHook
 	if !ancillary {
+		if r.Context().Err() != nil {
+			return cancelBeforeRoute()
+		}
 		var hookErr error
 		accepted, told, hookErr = s.runHooks(r.Context(), proto, r, parsed, accepted, call)
 		if hookErr != nil {
+			if r.Context().Err() != nil {
+				return cancelBeforeRoute()
+			}
 			return http.StatusBadGateway
 		}
+		if r.Context().Err() != nil {
+			return cancelBeforeRoute()
+		}
 		var status int
-		var rejected bool
-		accepted, status, rejected = s.runMiddleware(r.Context(), proto, accepted, call, w)
+		var rejected, canceled bool
+		accepted, status, rejected, canceled = s.runMiddleware(r.Context(), proto, accepted, call, w)
+		if canceled {
+			return cancelBeforeRoute()
+		}
 		if rejected {
 			return status
+		}
+		if r.Context().Err() != nil {
+			return cancelBeforeRoute()
 		}
 		again, perr := Parse(proto, r, accepted)
 		if perr != nil {
@@ -126,7 +158,10 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		call.Model = parsed.Model
 		call.Stream = parsed.Stream
 	}
-	meta := attemptMeta{Model: parsed.Model, Session: call.Session, TokenID: admitted.tokenID, Caller: admitted.caller, Protocol: string(proto)}
+	meta.Model = parsed.Model
+	if r.Context().Err() != nil {
+		return cancelBeforeRoute()
+	}
 	if code := gateModel(snap.Config, parsed.Model, admitted.allow); code != "" {
 		status := http.StatusNotFound
 		message := code
@@ -143,130 +178,391 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		writeProtocolError(w, proto, status, code, message)
 		return status
 	}
-	if code, status := s.spendBlock(r.Context(), admitted); code != "" {
+	if code, status := s.spendBlock(r.Context(), admitted, snap.Config); code != "" {
 		writeProtocolError(w, proto, status, code, code)
 		return status
 	}
-	if _, _, ok := login.ParseID(parsed.Model); ok {
-		return s.serveLogin(w, r, snap, proto, parsed, accepted, call, told, ancillary, meta)
+	loginAccount, loginModel, explicitLogin := login.ParseID(parsed.Model)
+	loginSnap := login.Snapshot{Status: "off"}
+	if explicitLogin || s.Login != nil {
+		loginSnap = login.Discover(s.loginMachine())
 	}
-	route, ids := candidates(snap.Config, parsed.Model)
+	var route routePick
+	var stateRoute state.Route
+	var seats []seatCandidate
+	var plannedGroup *groupPlan
+	if explicitLogin {
+		meta.Model = loginModel
+		stateRoute, _ = snap.Config.RouteByModel(parsed.Model)
+		route = routePick{id: stateRoute.ID, found: stateRoute.ID != "", allows: func(class string) bool {
+			return stateRoute.Allows(state.ErrorClass(class))
+		}}
+		rejectLogin := func(outcome, code string, status int) int {
+			s.note(snap, meta, usageNote{
+				RouteID: requestID, ProviderID: "login/" + loginAccount, ProviderAccount: loginAccount,
+				Outcome: outcome, Status: status, Started: requestStart, Rejected: true, Err: code,
+			})
+			writeProtocolError(w, proto, status, code, code)
+			return status
+		}
+		if loginSnap.Status == "unknown" {
+			return rejectLogin(CodeUnknown, CodeUnknown, http.StatusBadGateway)
+		}
+		account, found := findLoginAccount(loginSnap, loginAccount)
+		if !found {
+			return rejectLogin(CodeNoRoute, CodeNoRoute, http.StatusNotFound)
+		}
+		if !account.Readable || account.Plugin {
+			code := CodeUnknown
+			if account.Plugin {
+				code = "plugin"
+			}
+			return rejectLogin(code, code, http.StatusBadGateway)
+		}
+		if !state.AllowsModel(admitted.allow, parsed.Model, loginModel) {
+			return rejectLogin(CodeModelDenied, CodeModelDenied, http.StatusForbidden)
+		}
+		seats = []seatCandidate{loginSeatCandidate(loginAccount, loginModel)}
+	} else if group, found := snap.Config.GroupFor(parsed.Model); found {
+		plannedGroup = s.planGroup(r.Context(), snap.Config, parsed.Model, group, "", nil)
+		route = plannedGroup.route
+		seats = plannedGroup.seats
+	} else {
+		var providerIDs []string
+		route, providerIDs = candidates(snap.Config, parsed.Model)
+		stateRoute, _ = snap.Config.RouteByModel(parsed.Model)
+		noAuto := !route.found && snap.Config.NoAutoGroups && len(providerIDs) > 1
+		switch {
+		case !route.found && len(providerIDs) > 1 && !snap.Config.NoAutoGroups:
+			auto := state.Group{ID: "", Members: autoGroupMembers(providerIDs, parsed.Model)}
+			var extra []seatCandidate
+			if _, _, catalogID := snap.Config.MatchCatalog(parsed.Model); !catalogID {
+				extra = loginSeatCandidates(loginSnap, parsed.Model, "")
+			}
+			plannedGroup = s.planGroupWithExtra(r.Context(), snap.Config, parsed.Model, auto, "", nil, extra)
+			route = plannedGroup.route
+			seats = plannedGroup.seats
+		case noAuto:
+			// The user turned automatic groups off. A bare id shared by
+			// several providers is not silently sent to the first one.
+		default:
+			seats = providerCandidates(snap.Config, parsed.Model, providerIDs)
+			if !route.found {
+				if _, _, catalogID := snap.Config.MatchCatalog(parsed.Model); !catalogID {
+					seats = append(seats, loginSeatCandidates(loginSnap, parsed.Model, "")...)
+				}
+			}
+		}
+	}
 	if hasMedia(accepted) {
-		ids = withoutBlind(snap.Config, parsed.Model, ids)
-		if len(ids) == 0 {
+		filtered := filterVisionCandidates(snap.Config, parsed.Model, seats)
+		if plannedGroup != nil {
+			seats = retainSeatOrder(seats, filtered)
+			if !seatPresent(seats, plannedGroup.picked) {
+				plannedGroup.picked = firstSeatKey(seats, plannedGroup.blocked)
+			}
+		} else {
+			seats = filtered
+		}
+		if len(seats) == 0 {
 			writeProtocolError(w, proto, http.StatusBadRequest, CodeMedia, "模型不接受图片或视频")
 			return http.StatusBadRequest
 		}
 	}
-	if !ancillary {
-		ids = s.stickFirst(call.Session, ids)
+	routeID := requestID
+	if routeID == "" {
+		routeID = stateRoute.ID
 	}
-	if route.id == "" && len(ids) == 0 && !route.found {
+	picked, pool, strategyID := "", "", ""
+	var blocked map[string]bool
+	if plannedGroup != nil {
+		picked, blocked, pool, strategyID = plannedGroup.picked, plannedGroup.blocked, plannedGroup.pool, plannedGroup.strategyID
+	} else {
+		seats, picked, blocked, pool, strategyID = s.orderSeats(r.Context(), stateRoute, parsed.Model, seats)
+	}
+	stickyID := ""
+	if !ancillary {
+		stickyID = s.stickyOf(call.Session)
+		seats = stickFirstSeat(seats, stickyID, blocked)
+	}
+	if route.id == "" && len(seats) == 0 && !route.found {
 		writeProtocolError(w, proto, http.StatusNotFound, CodeNoRoute, CodeNoRoute)
 		return http.StatusNotFound
 	}
-	if len(ids) == 0 {
+	if len(seats) == 0 {
 		writeProtocolError(w, proto, http.StatusBadGateway, CodeNoProvider, CodeNoProvider)
 		return http.StatusBadGateway
 	}
-	var last codeResult
-	dialed := false
-	for _, providerID := range ids {
-		if err := r.Context().Err(); err != nil {
-			return last.statusOr(http.StatusBadGateway)
-		}
-		started := time.Now().UTC()
-		prov, pok := snap.Config.Provider(providerID)
-		if !pok {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
-			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
-			return http.StatusBadGateway
-		}
-		dest, known := providerProtocol(prov.Protocol, proto)
-		if !known || len(prov.Keys()) == 0 {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
-			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
-			return http.StatusBadGateway
-		}
-		switch security.CheckBaseURL(prov.BaseURL, s.consoleAddr(), "") {
-		case security.BaseOK:
-		case security.BaseUnknown:
-			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
-			writeProtocolError(w, proto, http.StatusBadGateway, CodeUnknown, CodeUnknown)
-			return http.StatusBadGateway
-		default:
-			s.note(snap, meta, route.id, providerID, CodeBaseURL, 0, started, nil)
-			writeProtocolError(w, proto, http.StatusBadGateway, CodeBaseURL, CodeBaseURL)
-			return http.StatusBadGateway
-		}
-		upModel := upstreamModel(snap.Config, parsed.Model, providerID)
-		outbound, err := outboundBody(parsed, accepted, dest, upModel)
-		if err != nil {
-			continue
-		}
-		if !ancillary {
-			outbound = s.rewriteTry(r.Context(), outbound, call, prov.ID, dest)
-		}
-		up, err := s.postProvider(r.Context(), prov, dest, upModel, parsed.Stream, outbound)
-		if err != nil && r.Context().Err() != nil {
-			s.note(snap, meta, route.id, providerID, CodeUnknown, 0, started, nil)
-			return last.statusOr(http.StatusBadGateway)
-		}
-		dialed = true
-		if err != nil {
-			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, string(state.ClassUpstreamUnavailable), 0, started, nil)
-			if last.stopped {
-				return last.status
-			}
-			continue
-		}
-		outcome := classifyStatus(up.StatusCode)
-		if outcome != "" || up.StatusCode < 200 || up.StatusCode >= 300 {
-			limited, _ := readLimited(up.Body, captureLimit)
-			up.Body.Close()
-			usage := usageObject(dest, limited)
-			class := outcome
-			if class == "" {
-				s.note(snap, meta, route.id, providerID, "http_"+itoa(up.StatusCode), up.StatusCode, started, usage)
-				writeUpstreamOrError(w, proto, up.StatusCode, limited)
-				return up.StatusCode
-			}
-			last = s.fail(w, snap, proto, route.allows, meta, route.id, providerID, class, up.StatusCode, started, usage)
-			if last.stopped {
-				return last.status
-			}
-			continue
-		}
-		s.remember(call.Session, providerID)
-		status, usage, output, complete := s.writeReply(w, r, up, proto, dest, parsed, call, told, ancillary)
-		outcome = OutcomeSuccess
-		if status < 200 || status >= 300 {
-			outcome = string(state.ClassUpstreamUnavailable)
-		}
-		s.note(snap, meta, route.id, providerID, outcome, status, started, usage)
-		if s.Store != nil && complete && !ancillary && call.Session != "" && status >= 200 && status < 300 {
-			_ = s.Store.AppendTurn(state.TurnRecord{
-				Session:    call.Session,
-				At:         time.Now().UTC(),
-				Model:      meta.Model,
-				Caller:     meta.Caller,
-				ProviderID: providerID,
-				Protocol:   meta.Protocol,
-				Input:      lastUserText(parsed.Messages),
-				Output:     output,
-			})
-		}
-		return status
+	type attemptResult struct {
+		providerID      string
+		providerAccount string
+		model           string
+		outcome         string
+		status          int
+		started         time.Time
+		usage           json.RawMessage
+		providerKeyID   string
+		errText         string
+		errType         string
+		rejected        bool
+		firstByte       time.Time
+		firstText       time.Time
+		bytesIn         int64
+		bytesOut        int64
+		canceled        bool
 	}
-	if !dialed {
-		writeProtocolError(w, proto, http.StatusBadGateway, "unsupported", "unsupported")
-		return http.StatusBadGateway
+	modelOf := func(item attemptResult) string {
+		if item.model != "" {
+			return item.model
+		}
+		return upstreamModel(snap.Config, parsed.Model, item.providerID)
 	}
-	if last.status == 0 {
-		writeProtocolError(w, proto, http.StatusBadGateway, CodeNoProvider, CodeNoProvider)
-		return http.StatusBadGateway
+	var last attemptResult
+	attempts := 0
+	firstStart := time.Time{}
+	var lastEnd time.Time
+	tries := func() int {
+		if attempts > 1 {
+			return attempts
+		}
+		return 0
 	}
-	return last.status
+	queueMS := func() int {
+		if firstStart.IsZero() {
+			return 0
+		}
+		return millis(firstStart.Sub(requestStart))
+	}
+	retryMS := func(item attemptResult) int {
+		if lastEnd.IsZero() || item.started.IsZero() {
+			return 0
+		}
+		return millis(item.started.Sub(lastEnd))
+	}
+	ttftMS := func(item attemptResult, at time.Time) int {
+		if item.started.IsZero() || at.IsZero() {
+			return 0
+		}
+		return millis(at.Sub(item.started))
+	}
+	writeFinal := func(item attemptResult) {
+		s.note(snap, meta, usageNote{
+			Model:   modelOf(item),
+			RouteID: routeID, Route: route.id, ProviderID: item.providerID,
+			ProviderAccount: item.providerAccount,
+			Outcome:         item.outcome, Status: item.status, Started: requestStart,
+			Usage: item.usage, Tries: tries(), ProviderKeyID: item.providerKeyID,
+			Err: item.errText, ErrType: item.errType, Rejected: item.rejected,
+			TTFTMS: ttftMS(item, item.firstByte), FirstTextMS: ttftMS(item, item.firstText),
+			QueueMS: queueMS(), RetryMS: retryMS(item),
+			BytesIn: item.bytesIn, BytesOut: item.bytesOut,
+		})
+	}
+	writeCanceled := func(item attemptResult) int {
+		s.note(snap, meta, usageNote{
+			Model:   modelOf(item),
+			RouteID: routeID, Route: route.id, ProviderID: item.providerID,
+			ProviderAccount: item.providerAccount,
+			Outcome:         "canceled", Status: 499, Started: requestStart,
+			Usage: item.usage, Tries: tries(), ProviderKeyID: item.providerKeyID,
+			Err: state.CanceledText, ErrType: "agent_canceled",
+			TTFTMS: ttftMS(item, item.firstByte), FirstTextMS: ttftMS(item, item.firstText),
+			QueueMS: queueMS(), RetryMS: retryMS(item),
+			BytesIn: item.bytesIn, BytesOut: item.bytesOut,
+		})
+		return 499
+	}
+	finishFailure := func(item attemptResult, class string) int {
+		if class == "" {
+			class = CodeUnknown
+		}
+		if item.outcome == "" {
+			item.outcome = class
+		}
+		if item.status == 0 {
+			item.status = statusFor(class)
+		}
+		if item.errText == "" {
+			item.errText = class
+		}
+		writeFinal(item)
+		writeProtocolError(w, proto, item.status, class, class)
+		return item.status
+	}
+	for i := 0; i < len(seats); i++ {
+		if r.Context().Err() != nil {
+			return writeCanceled(attemptResult{providerID: last.providerID, providerAccount: last.providerAccount, model: last.model, started: requestStart})
+		}
+		chosen, release, waited, ok := s.acquireSeat(r.Context(), seats, i, blocked)
+		if !ok {
+			if r.Context().Err() != nil {
+				return writeCanceled(attemptResult{providerID: last.providerID, providerAccount: last.providerAccount, model: last.model, started: requestStart})
+			}
+			errText := "queue_full"
+			if waited > 0 {
+				errText = "queue_wait"
+			}
+			seat := seats[i]
+			return finishFailure(attemptResult{
+				providerID: seat.ProviderID, providerAccount: seat.Account, model: seat.Model,
+				outcome: string(state.ClassRateLimit), status: http.StatusTooManyRequests,
+				started: time.Now().UTC(), errText: errText, rejected: true,
+			}, string(state.ClassRateLimit))
+		}
+		i = chosen
+		seat := seats[chosen]
+		status, stop := func() (int, bool) {
+			if release != nil {
+				defer release()
+			}
+			attempts++
+			started := time.Now().UTC()
+			if firstStart.IsZero() {
+				firstStart = started
+			}
+			providerID := seat.ProviderID
+			dest := seat.Protocol
+			providerKeyID := ""
+			prov := state.Provider{}
+			if seat.Login {
+				if seat.Account == "" {
+					return finishFailure(attemptResult{providerID: providerID, providerAccount: seat.Account, outcome: CodeUnknown, started: started, rejected: true}, CodeUnknown), true
+				}
+			} else {
+				var pok bool
+				prov, pok = snap.Config.Provider(providerID)
+				if !pok {
+					return finishFailure(attemptResult{providerID: providerID, providerAccount: seat.Account, outcome: CodeUnknown, started: started, rejected: true}, CodeUnknown), true
+				}
+				var known bool
+				dest, known = providerProtocol(prov.Protocol, proto)
+				keys := prov.Keys()
+				if !known || len(keys) == 0 || seat.KeyIndex < 0 || seat.KeyIndex >= len(keys) {
+					return finishFailure(attemptResult{providerID: providerID, providerAccount: seat.Account, outcome: CodeUnknown, started: started, rejected: true}, CodeUnknown), true
+				}
+				switch security.CheckBaseURL(prov.BaseURL, s.consoleAddr(), "") {
+				case security.BaseOK:
+				case security.BaseUnknown:
+					return finishFailure(attemptResult{providerID: providerID, providerAccount: seat.Account, outcome: CodeUnknown, started: started, rejected: true}, CodeUnknown), true
+				default:
+					return finishFailure(attemptResult{providerID: providerID, providerAccount: seat.Account, outcome: CodeBaseURL, started: started, rejected: true}, CodeBaseURL), true
+				}
+				providerKeyID = state.KeyFingerprint(keys[seat.KeyIndex])
+			}
+			upModel := seat.Model
+			outbound, err := outboundBody(parsed, accepted, dest, upModel)
+			if err != nil {
+				last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: upModel, outcome: "unsupported", status: http.StatusBadGateway, started: started, errText: "unsupported", rejected: true}
+				return 0, false
+			}
+			if !ancillary && !seat.Login {
+				outbound = s.rewriteTry(r.Context(), outbound, call, prov.ID, dest)
+			}
+			sent := outboundModel(dest, outbound, upModel)
+			up, err := s.postSeat(r.Context(), seat, dest, upModel, parsed.Stream, outbound)
+			if err != nil && r.Context().Err() != nil {
+				return writeCanceled(attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, providerKeyID: providerKeyID, started: started}), true
+			}
+			if err != nil {
+				if errors.Is(err, login.ErrPlugin) {
+					last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: "plugin", status: http.StatusBadGateway, started: started, errText: "plugin", rejected: true}
+					return finishFailure(last, "plugin"), true
+				}
+				class := string(state.ClassUpstreamUnavailable)
+				last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: class, started: started, providerKeyID: providerKeyID, errText: class, bytesIn: int64(len(outbound))}
+				s.markFailure(pool, seat.Key, class)
+				if !s.fallThrough(route, seats, chosen, class) {
+					return finishFailure(last, class), true
+				}
+				lastEnd = time.Now().UTC()
+				return 0, false
+			}
+			outcome := classifyStatus(up.StatusCode)
+			if outcome != "" || up.StatusCode < 200 || up.StatusCode >= 300 {
+				limited, _ := readLimited(up.Body, captureLimit)
+				up.Body.Close()
+				usage := usageObject(dest, limited)
+				class := outcome
+				if class == "" {
+					last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: "http_" + itoa(up.StatusCode), status: up.StatusCode, started: started, usage: usage, providerKeyID: providerKeyID, bytesIn: int64(len(outbound)), bytesOut: int64(len(limited))}
+					writeFinal(last)
+					writeUpstreamOrError(w, proto, up.StatusCode, limited)
+					return up.StatusCode, true
+				}
+				last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: class, status: up.StatusCode, started: started, usage: usage, providerKeyID: providerKeyID, bytesIn: int64(len(outbound)), bytesOut: int64(len(limited))}
+				s.markFailure(pool, seat.Key, class)
+				if !s.fallThrough(route, seats, chosen, class) {
+					return finishFailure(last, class), true
+				}
+				retry := time.Now().UTC()
+				if chosen < len(seats)-1 && usageTokens(usage) > 0 {
+					s.note(snap, meta, usageNote{
+						Model:   sent,
+						RouteID: routeID, Route: route.id, ProviderID: providerID, ProviderAccount: seat.Account,
+						Outcome: class, Status: up.StatusCode, Started: started,
+						Usage: usage, ProviderKeyID: providerKeyID, HandedOn: true,
+						BytesIn: last.bytesIn, BytesOut: last.bytesOut,
+					})
+				}
+				lastEnd = retry
+				return 0, false
+			}
+			s.remember(call.Session, seat.Key)
+			asked := parsed
+			if seat.Login && seat.Account == "claude" {
+				asked.Stream = false
+			}
+			reply := s.writeReply(w, r, up, proto, dest, asked, call, told, ancillary)
+			status, usage, output, complete, firstByte := reply.status, reply.usage, reply.output, reply.complete, reply.firstByte
+			outcome = OutcomeSuccess
+			if status < 200 || status >= 300 {
+				outcome = string(state.ClassUpstreamUnavailable)
+			}
+			last = attemptResult{
+				providerID: providerID, providerAccount: seat.Account, model: sent, outcome: outcome, status: status, started: started,
+				usage: usage, providerKeyID: providerKeyID,
+				firstByte: firstByte, firstText: reply.firstText,
+				bytesIn: int64(len(outbound)), bytesOut: reply.bytesOut,
+			}
+			if reply.canceled {
+				last.outcome = "canceled"
+				last.status = 499
+				return writeCanceled(last), true
+			}
+			writeFinal(last)
+			if outcome == OutcomeSuccess {
+				// A negative ttft means no first byte was measured (whole reply).
+				ttft := time.Duration(-1)
+				if !firstByte.IsZero() {
+					if ttft = firstByte.Sub(started); ttft < 0 {
+						ttft = 0
+					}
+				}
+				s.markSuccess(seat, started, usage, ttft)
+				s.moveRound(pool, strategyID, seatByKey(seats, picked), seat, stickyID)
+			}
+			if s.Store != nil && complete && !ancillary && call.Session != "" && status >= 200 && status < 300 {
+				_ = s.Store.AppendTurn(state.TurnRecord{
+					Session:    call.Session,
+					At:         time.Now().UTC(),
+					Model:      upModel,
+					Caller:     meta.Caller,
+					ProviderID: providerID,
+					Protocol:   meta.Protocol,
+					Input:      lastUserText(parsed.Messages),
+					Output:     output,
+				})
+			}
+			return status, true
+		}()
+		if stop {
+			return status
+		}
+	}
+	if last.providerID == "" {
+		return finishFailure(attemptResult{outcome: "unsupported", rejected: true}, "unsupported")
+	}
+	return finishFailure(last, last.outcome)
 }
 
 type routePick struct {
@@ -301,52 +597,124 @@ func candidates(cfg state.Config, model string) (routePick, []string) {
 }
 
 type attemptMeta struct {
-	Model    string
-	Session  string
-	TokenID  string
-	Caller   string
-	Protocol string
+	Model          string
+	Session        string
+	TokenID        string
+	CallerKeyID    string
+	CallerIssuerID string
+	Caller         string
+	Agent          string
+	Protocol       string
 }
 
-func (s *Server) note(snap *state.Snapshot, meta attemptMeta, routeID, providerID, outcome string, status int, started time.Time, usage json.RawMessage) {
+type usageNote struct {
+	Model           string
+	RouteID         string
+	Route           string
+	ProviderID      string
+	ProviderAccount string
+	ProviderKeyID   string
+	Outcome         string
+	Status          int
+	Started         time.Time
+	Finished        time.Time
+	Usage           json.RawMessage
+	Tries           int
+	HandedOn        bool
+	Rejected        bool
+	Source          string
+	Err             string
+	ErrType         string
+	Operation       string
+	Cost            *float64
+	TTFTMS          int
+	FirstTextMS     int
+	QueueMS         int
+	RetryMS         int
+	BytesIn         int64
+	BytesOut        int64
+}
+
+func (s *Server) note(snap *state.Snapshot, meta attemptMeta, n usageNote) {
 	if s == nil || s.Store == nil {
 		return
 	}
+	if n.Started.IsZero() {
+		n.Started = time.Now().UTC()
+	}
+	if n.Finished.IsZero() {
+		n.Finished = time.Now().UTC()
+	}
+	callerKeyID := meta.CallerKeyID
+	if callerKeyID == "" {
+		callerKeyID = meta.TokenID
+	}
+	agent := meta.Agent
+	if agent == "" {
+		agent = meta.Caller
+	}
+	model := n.Model
+	if model == "" {
+		model = meta.Model
+	}
 	_ = s.Store.AppendUsage(state.AttemptRecord{
-		RouteID:    routeID,
-		ProviderID: providerID,
-		Outcome:    outcome,
-		Status:     status,
-		Started:    started,
-		Finished:   time.Now().UTC(),
-		Usage:      cloneRaw(usage),
-		Model:      meta.Model,
-		Session:    meta.Session,
-		TokenID:    meta.TokenID,
-		Caller:     meta.Caller,
-		Protocol:   meta.Protocol,
+		RouteID:         n.RouteID,
+		Route:           n.Route,
+		ProviderID:      n.ProviderID,
+		ProviderAccount: n.ProviderAccount,
+		ProviderKeyID:   n.ProviderKeyID,
+		Outcome:         n.Outcome,
+		Status:          n.Status,
+		Started:         n.Started,
+		Finished:        n.Finished,
+		Usage:           cloneRaw(n.Usage),
+		Model:           model,
+		Session:         meta.Session,
+		TokenID:         callerKeyID,
+		CallerKeyID:     callerKeyID,
+		CallerIssuerID:  meta.CallerIssuerID,
+		Caller:          meta.Caller,
+		Agent:           agent,
+		Protocol:        meta.Protocol,
+		Operation:       n.Operation,
+		Source:          n.Source,
+		Err:             n.Err,
+		ErrType:         n.ErrType,
+		Tries:           n.Tries,
+		HandedOn:        n.HandedOn,
+		Rejected:        n.Rejected,
+		Cost:            n.Cost,
+		TTFTMS:          n.TTFTMS,
+		FirstTextMS:     n.FirstTextMS,
+		QueueMS:         n.QueueMS,
+		RetryMS:         n.RetryMS,
+		BytesIn:         n.BytesIn,
+		BytesOut:        n.BytesOut,
 	})
 }
 
-type codeResult struct {
-	status  int
-	stopped bool
+// millis converts a non-negative duration to milliseconds. Negative spans and
+// sub-millisecond spans are zero.
+func millis(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	ms := d / time.Millisecond
+	if ms <= 0 {
+		return 0
+	}
+	if ms > 1<<31-1 {
+		return 1<<31 - 1
+	}
+	return int(ms)
 }
 
-func (c codeResult) statusOr(fallback int) int {
-	if c.status == 0 {
-		return fallback
+func usageTokens(raw json.RawMessage) int {
+	counts, ok := state.CountsFromUsage(raw)
+	if !ok {
+		return 0
 	}
-	return c.status
-}
-
-func (s *Server) fail(w http.ResponseWriter, snap *state.Snapshot, proto Protocol, allows func(string) bool, meta attemptMeta, routeID, providerID, class string, status int, started time.Time, usage json.RawMessage) codeResult {
-	s.note(snap, meta, routeID, providerID, class, status, started, usage)
-	if allows != nil && allows(class) {
-		return codeResult{status: statusFor(class)}
-	}
-	writeProtocolError(w, proto, statusFor(class), class, class)
-	return codeResult{status: statusFor(class), stopped: true}
+	return counts.Total()
 }
 
 func classifyStatus(status int) string {
@@ -364,35 +732,96 @@ func classifyStatus(status int) string {
 	return ""
 }
 
+// outboundModel is the model the provider receives. Chat, Responses,
+// Anthropic, and Ollama carry it in the body, including a rewrite made by
+// OnTry. Gemini carries it in the URL, so that protocol keeps the endpoint
+// model.
+func outboundModel(proto Protocol, body []byte, fallback string) string {
+	if proto == ProtoGemini {
+		return fallback
+	}
+	var doc struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &doc) == nil && doc.Model != "" {
+		return doc.Model
+	}
+	return fallback
+}
+
 func (s *Server) postProvider(ctx context.Context, prov state.Provider, proto Protocol, model string, stream bool, body []byte) (*http.Response, error) {
+	resp, _, err := s.postProviderKey(ctx, prov, proto, model, stream, body)
+	return resp, err
+}
+
+// postSeat dials one strategy seat: one provider key, or one subscription
+// account. A provider key is never swapped inside this call; the next seat is
+// the next key the strategy ordered.
+func (s *Server) postSeat(ctx context.Context, seat seatCandidate, proto Protocol, model string, stream bool, body []byte) (*http.Response, error) {
+	if seat.Login {
+		if seat.Account == "claude" {
+			stream = false
+		}
+		return login.Dial(ctx, s.loginMachine(), seat.Account, model, body, stream)
+	}
+	keys := seat.Provider.Keys()
+	if seat.KeyIndex < 0 || seat.KeyIndex >= len(keys) {
+		return nil, errBadBody
+	}
+	return s.postKey(ctx, seat.Provider, proto, model, stream, body, keys[seat.KeyIndex])
+}
+
+// fallThrough reports whether a failed seat may be followed by another one.
+// A sibling seat of the same provider or WorkBuddy family is always tried;
+// crossing to another vendor follows a common group's eligible list, or the
+// route's eligible list when no group covers both.
+func (s *Server) fallThrough(route routePick, seats []seatCandidate, at int, class string) bool {
+	if at+1 >= len(seats) {
+		return false
+	}
+	next := seats[at+1]
+	if sameVendor(seats[at], next) {
+		return true
+	}
+	if scopesAllow(seats[at], next, class) {
+		return true
+	}
+	return route.allows != nil && route.allows(class)
+}
+
+// postProviderKey sends the request and names the upstream key fingerprint
+// that produced the returned response. The key itself is not returned.
+func (s *Server) postProviderKey(ctx context.Context, prov state.Provider, proto Protocol, model string, stream bool, body []byte) (*http.Response, string, error) {
 	keys := prov.Keys()
 	if len(keys) == 0 {
 		keys = []string{""}
 	}
 	var last *http.Response
+	lastKey := ""
 	for i, key := range keys {
 		resp, err := s.postKey(ctx, prov, proto, model, stream, body, key)
 		if err != nil {
 			if last != nil {
 				last.Body.Close()
 			}
-			return nil, err
+			return nil, state.KeyFingerprint(key), err
 		}
 		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
 			if last != nil {
 				last.Body.Close()
 			}
-			return resp, nil
+			return resp, state.KeyFingerprint(key), nil
 		}
 		if last != nil {
 			last.Body.Close()
 		}
 		last = resp
+		lastKey = state.KeyFingerprint(key)
 		if i == len(keys)-1 {
-			return resp, nil
+			return resp, lastKey, nil
 		}
 	}
-	return last, nil
+	return last, lastKey, nil
 }
 
 func (s *Server) postKey(ctx context.Context, prov state.Provider, proto Protocol, model string, stream bool, body []byte, key string) (*http.Response, error) {
@@ -430,18 +859,56 @@ func (s *Server) httpClient(base string) *http.Client {
 	}
 }
 
-func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) (int, json.RawMessage, string, bool) {
+// firstWriteWriter records when the first body byte went to the client and
+// how many body bytes the gateway sent. Header bytes are not counted.
+type firstWriteWriter struct {
+	http.ResponseWriter
+	first *time.Time
+	bytes int64
+}
+
+func (w *firstWriteWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if n > 0 {
+		w.bytes += int64(n)
+		if w.first.IsZero() {
+			*w.first = time.Now()
+		}
+	}
+	return n, err
+}
+
+// Flush keeps the wrapped writer's streaming capability.
+func (w *firstWriteWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// replyStats is one provider reply as it went to the client. firstByte and
+// firstText are zero for a whole JSON reply.
+type replyStats struct {
+	status    int
+	usage     json.RawMessage
+	output    string
+	complete  bool
+	firstByte time.Time
+	firstText time.Time
+	bytesOut  int64
+	canceled  bool
+}
+
+func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) replyStats {
 	defer up.Body.Close()
 	stream := parsed.Stream || strings.Contains(strings.ToLower(up.Header.Get("Content-Type")), "text/event-stream")
 	if stream {
-		status, usage, output, complete := s.writeStream(w, r.Context(), up, inbound, dest, parsed.Model, call, told, ancillary)
-		return status, usage, output, complete
+		return s.writeStream(w, r.Context(), up, inbound, dest, parsed.Model, call, told, ancillary)
 	}
 	body, err := readLimited(up.Body, bodyLimit)
 	if err != nil {
 		writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), string(state.ClassUpstreamUnavailable))
 		s.observe(told, call, nil, false)
-		return http.StatusBadGateway, nil, "", false
+		return replyStats{status: http.StatusBadGateway, canceled: r.Context().Err() != nil}
 	}
 	status := up.StatusCode
 	if status == 0 {
@@ -453,7 +920,7 @@ func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Res
 		if cerr != nil {
 			writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), cerr.Error())
 			s.observe(told, call, nil, false)
-			return http.StatusBadGateway, usageObject(dest, body), "", false
+			return replyStats{status: http.StatusBadGateway, usage: usageObject(dest, body)}
 		}
 		out = converted
 	}
@@ -469,10 +936,17 @@ func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Res
 	if complete {
 		output = replyText(inbound, out)
 	}
-	return status, usageObject(dest, body), output, complete
+	return replyStats{
+		status: status, usage: usageObject(dest, body), output: output,
+		complete: complete, bytesOut: int64(len(out)),
+		canceled: !complete && r.Context().Err() != nil,
+	}
 }
 
-func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool) (int, json.RawMessage, string, bool) {
+func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool) replyStats {
+	var first time.Time
+	ww := &firstWriteWriter{ResponseWriter: w, first: &first}
+	w = ww
 	if dest != inbound && inbound == ProtoOllama {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	} else {
@@ -502,15 +976,35 @@ func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *htt
 			output = joinedStreamText(dest, captured.Bytes())
 		}
 		s.observe(told, call, captureBytes(captured.Bytes(), success), complete)
-		if ancillary {
-			return http.StatusOK, usage.object(), "", false
+		stats := replyStats{
+			status: http.StatusOK, usage: usage.object(), output: output, complete: complete,
+			firstByte: first, bytesOut: ww.bytes,
 		}
-		return http.StatusOK, usage.object(), output, complete
+		if ancillary {
+			stats.output = ""
+			stats.complete = false
+			return stats
+		}
+		if output != "" {
+			stats.firstText = first
+		}
+		stats.canceled = !complete && ctx.Err() != nil
+		return stats
 	}
 	if dest != inbound {
-		return s.convertStream(w, up, inbound, dest, model, call, told, ancillary, flush)
+		status, usageOut, output, complete := s.convertStream(w, up, inbound, dest, model, call, told, ancillary, flush)
+		stats := replyStats{
+			status: status, usage: usageOut, output: output, complete: complete,
+			firstByte: first, bytesOut: ww.bytes,
+		}
+		if output != "" {
+			stats.firstText = first
+		}
+		stats.canceled = !complete && ctx.Err() != nil
+		return stats
 	}
 	var text strings.Builder
+	var firstText time.Time
 	err := readSSE(up.Body, func(data []byte) error {
 		usage.see(data)
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
@@ -531,7 +1025,11 @@ func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *htt
 		if drop {
 			return nil
 		}
-		text.WriteString(deltaText(inbound, out))
+		delta := deltaText(inbound, out)
+		if delta != "" && firstText.IsZero() {
+			firstText = time.Now()
+		}
+		text.WriteString(delta)
 		return writeSSE(w, out, flush)
 	})
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -542,11 +1040,18 @@ func (s *Server) writeStream(w http.ResponseWriter, ctx context.Context, up *htt
 	if complete && !ancillary {
 		output = text.String()
 	}
+	stats := replyStats{
+		status: http.StatusOK, usage: usage.object(), output: output, complete: complete,
+		firstByte: first, firstText: firstText, bytesOut: ww.bytes,
+		canceled: !complete && ctx.Err() != nil,
+	}
 	if ancillary {
-		return http.StatusOK, usage.object(), "", false
+		stats.output = ""
+		stats.complete = false
+		return stats
 	}
 	s.observe(told, call, nil, false)
-	return http.StatusOK, usage.object(), output, complete
+	return stats
 }
 
 func (s *Server) convertStream(w http.ResponseWriter, up *http.Response, inbound, dest Protocol, model string, call CallContext, told []RequestHook, ancillary bool, flush func()) (int, json.RawMessage, string, bool) {
@@ -622,7 +1127,7 @@ func (s *Server) runHooks(ctx context.Context, proto Protocol, r *http.Request, 
 	return body, told, nil
 }
 
-func (s *Server) runMiddleware(ctx context.Context, proto Protocol, body []byte, call CallContext, w http.ResponseWriter) ([]byte, int, bool) {
+func (s *Server) runMiddleware(ctx context.Context, proto Protocol, body []byte, call CallContext, w http.ResponseWriter) ([]byte, int, bool, bool) {
 	for _, item := range s.Middleware {
 		if item == nil {
 			continue
@@ -645,7 +1150,7 @@ func (s *Server) runMiddleware(ctx context.Context, proto Protocol, body []byte,
 		}(item)
 		select {
 		case <-ctx.Done():
-			return body, 499, true
+			return body, 0, false, true
 		case got := <-ch:
 			if got.reject != nil {
 				status := got.reject.Status
@@ -653,7 +1158,7 @@ func (s *Server) runMiddleware(ctx context.Context, proto Protocol, body []byte,
 					status = http.StatusBadRequest
 				}
 				writeProtocolError(w, proto, status, "rejected", got.reject.Message)
-				return body, status, true
+				return body, status, true, false
 			}
 			if json.Valid(got.body) && len(got.body) > 0 && got.body[0] == '{' {
 				body = append([]byte(nil), got.body...)
@@ -661,7 +1166,7 @@ func (s *Server) runMiddleware(ctx context.Context, proto Protocol, body []byte,
 		case <-time.After(middlewareTimeout + 50*time.Millisecond):
 		}
 	}
-	return body, 0, false
+	return body, 0, false, false
 }
 
 func (s *Server) rewriteTry(ctx context.Context, body []byte, call CallContext, providerID string, proto Protocol) []byte {
@@ -725,20 +1230,26 @@ func (s *Server) observe(hooks []RequestHook, call CallContext, reply []byte, su
 	}()
 }
 
-func (s *Server) stickFirst(session string, ids []string) []string {
-	if session == "" || len(ids) < 2 {
-		return ids
+func (s *Server) stickyOf(session string) string {
+	if session == "" {
+		return ""
 	}
 	s.stickyMu.Lock()
 	id := s.sticky[session]
 	s.stickyMu.Unlock()
-	if id == "" {
+	return id
+}
+
+// stickFirst moves the session's provider to the front when it can still
+// answer. A blocked seat (resting or spent) is not stuck to.
+func stickFirst(ids []string, stickyID string, blocked map[string]bool) []string {
+	if stickyID == "" || len(ids) < 2 || blocked[stickyID] {
 		return ids
 	}
 	out := make([]string, 0, len(ids))
 	found := false
 	for _, candidate := range ids {
-		if candidate == id {
+		if candidate == stickyID {
 			found = true
 			continue
 		}
@@ -747,7 +1258,34 @@ func (s *Server) stickFirst(session string, ids []string) []string {
 	if !found {
 		return ids
 	}
-	return append([]string{id}, out...)
+	return append([]string{stickyID}, out...)
+}
+
+// stickFirstSeat moves the session's seat to the front when it is still a
+// candidate and can answer. The seat key is per key or subscription account,
+// so two keys of one provider are two different sticky targets.
+func stickFirstSeat(seats []seatCandidate, stickyKey string, blocked map[string]bool) []seatCandidate {
+	if stickyKey == "" || len(seats) < 2 || blocked[stickyKey] {
+		return seats
+	}
+	out := make([]seatCandidate, 0, len(seats))
+	found := false
+	for _, candidate := range seats {
+		if candidate.Key == stickyKey {
+			found = true
+			continue
+		}
+		out = append(out, candidate)
+	}
+	if !found {
+		return seats
+	}
+	for _, candidate := range seats {
+		if candidate.Key == stickyKey {
+			return append([]seatCandidate{candidate}, out...)
+		}
+	}
+	return seats
 }
 
 func (s *Server) remember(session, providerID string) {
