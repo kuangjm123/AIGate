@@ -6,6 +6,7 @@ package agent
 
 import (
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,17 +30,110 @@ type Model struct {
 }
 
 // Target is the gateway the agent should call. Origin has no path.
+// Token overrides the local app caller for a Codex that reaches the gateway
+// from another machine. Keys are issued gateway secrets that a provider table
+// may already carry. Allowed maps an issued secret to its model list; an empty
+// or missing list allows every model. Used lists model ids Codex used, most
+// recent first.
 type Target struct {
-	Origin string
+	Origin  string
+	Token   string
+	Keys    []string
+	Allowed map[string][]string
+	Used    []string
 }
 
 func (t Target) clean() Target {
 	t.Origin = strings.TrimRight(strings.TrimSpace(t.Origin), "/")
+	t.Token = strings.TrimSpace(t.Token)
 	return t
 }
 
 func (t Target) v1() string {
 	return t.clean().Origin + "/v1"
+}
+
+func (t Target) codexURL() string {
+	return t.clean().Origin + "/backend-api/codex"
+}
+
+// bearer is the token a new provider table carries, and whether the target
+// has one the gateway can take. A loopback caller may present this
+// application's name. One from another machine needs an issued gateway
+// token, so the first live key stands in for the sharing key.
+func (t Target) bearer(id string) (string, bool) {
+	t = t.clean()
+	if t.Token != "" {
+		return t.Token, true
+	}
+	if t.local() {
+		return caller(id), true
+	}
+	for _, key := range t.Keys {
+		if key = strings.TrimSpace(key); key != "" {
+			return key, true
+		}
+	}
+	return "", false
+}
+
+func (t Target) keepsCredential(secret string) bool {
+	t = t.clean()
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return false
+	}
+	if secret == t.Token {
+		return true
+	}
+	for _, key := range t.Keys {
+		if secret == strings.TrimSpace(key) {
+			return true
+		}
+	}
+	if t.Token != "" {
+		return false
+	}
+	return t.local()
+}
+
+func (t Target) allowed(secret string) ([]string, bool) {
+	secret = strings.TrimSpace(secret)
+	if len(t.Allowed) == 0 {
+		return nil, false
+	}
+	models, ok := t.Allowed[secret]
+	return models, ok
+}
+
+func (t Target) modelsFor(secret string, models []Model) []Model {
+	allow, ok := t.allowed(secret)
+	if !ok || len(allow) == 0 {
+		return models
+	}
+	out := make([]Model, 0, len(models))
+	for _, model := range models {
+		if state.AllowsModel(allow, model.ID, model.Bare) {
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+// local reports whether Codex on this computer reaches the gateway on a
+// loopback address. A loopback caller may present any non-empty credential;
+// one from another machine needs a token the gateway issued.
+func (t Target) local() bool {
+	u, err := urlParse(t.Origin)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Machine is the computer whose agent config is read. StashDir holds the notes
@@ -151,6 +245,12 @@ func Offers(cfg state.Config) []Model {
 		}
 		routed[route.ModelMatch] = true
 		add(route.ModelMatch, route.ModelMatch, route.ModelMatch, 0, false, nil)
+	}
+	for _, group := range cfg.Groups {
+		if group.ID == "" {
+			continue
+		}
+		add("group/"+group.ID, group.ID, group.ID, 0, false, nil)
 	}
 	for _, p := range cfg.Providers {
 		owner := p.ID

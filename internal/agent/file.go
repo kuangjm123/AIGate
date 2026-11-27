@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -24,8 +26,12 @@ type field struct {
 }
 
 type record struct {
-	Fields  map[string]field  `json:"fields"`
-	Written map[string]string `json:"written,omitempty"`
+	Fields        map[string]field  `json:"fields"`
+	Written       map[string]string `json:"written,omitempty"`
+	Catalog       string            `json:"catalog,omitempty"`
+	CatalogKnown  bool              `json:"catalog_known,omitempty"`
+	CatalogBefore string            `json:"catalog_before,omitempty"`
+	Capability    bool              `json:"capability,omitempty"`
 }
 
 func loadRecord(m Machine, id string) (record, bool, error) {
@@ -162,13 +168,40 @@ func commit(m Machine, id, path string, existed bool, orig, next []byte, rec rec
 }
 
 func restoreFile(path string, existed bool, orig []byte) {
+	_ = restoreFileState(path, existed, orig)
+}
+
+func restoreFileState(path string, existed bool, orig []byte) error {
 	if !existed {
-		_ = os.Remove(path)
-		return
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
 	if orig != nil {
-		_ = writeAtomic(path, orig)
+		return writeAtomic(path, orig)
 	}
+	return nil
+}
+
+func readOptionalFile(path string) ([]byte, bool, error) {
+	b, err := os.ReadFile(path)
+	if err == nil {
+		return b, true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func secretDigest(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
 }
 
 func writeAtomic(path string, data []byte) error {

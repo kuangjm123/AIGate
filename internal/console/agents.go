@@ -7,6 +7,7 @@ import (
 
 	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/respond"
+	"github.com/kuangjm123/AIGate/internal/state"
 )
 
 func agentAction(path string) (string, string, bool) {
@@ -52,7 +53,9 @@ func (s *Server) listAgents(w http.ResponseWriter) int {
 		respond.JSON(w, http.StatusOK, map[string]string{"status": "unknown"})
 		return http.StatusOK
 	}
-	if s.Store.Current() == nil {
+	_ = agent.SyncCodex(m)
+	snap := s.Store.Current()
+	if snap == nil {
 		respond.Error(w, http.StatusServiceUnavailable, "config_unreadable")
 		return http.StatusServiceUnavailable
 	}
@@ -60,7 +63,7 @@ func (s *Server) listAgents(w http.ResponseWriter) int {
 	respond.JSON(w, http.StatusOK, map[string]any{
 		"status":  "ok",
 		"gateway": origin,
-		"agents":  agent.Inspect(m, agent.Target{Origin: origin}),
+		"agents":  agent.Inspect(m, gatewayTarget(snap.Config, origin, nil)),
 	})
 	return http.StatusOK
 }
@@ -83,7 +86,7 @@ func (s *Server) changeAgent(w http.ResponseWriter, id string, connect bool) int
 		respond.Error(w, http.StatusServiceUnavailable, "config_unreadable")
 		return http.StatusServiceUnavailable
 	}
-	gw := agent.Target{Origin: s.gatewayOrigin()}
+	gw := gatewayTarget(snap.Config, s.gatewayOrigin(), s.recentModels("codex"))
 	if connect {
 		err = agent.Connect(m, id, gw, s.offerModels(snap.Config))
 	} else {
@@ -102,13 +105,66 @@ func (s *Server) changeAgent(w http.ResponseWriter, id string, connect bool) int
 	return http.StatusNotFound
 }
 
+func gatewayTarget(cfg state.Config, origin string, used []string) agent.Target {
+	target := agent.Target{Origin: origin, Used: used}
+	for _, token := range cfg.GatewayTokens {
+		secret := strings.TrimSpace(token.Secret)
+		if token.Revoked || secret == "" {
+			continue
+		}
+		target.Keys = append(target.Keys, secret)
+		if target.Allowed == nil {
+			target.Allowed = map[string][]string{}
+		}
+		target.Allowed[secret] = append([]string(nil), token.Models...)
+	}
+	return target
+}
+
+func (s *Server) recentModels(agentID string) []string {
+	if s.Store == nil {
+		return nil
+	}
+	recs, err := s.Store.ReadUsage(state.UsageFilter{})
+	if err != nil {
+		return nil
+	}
+	state.SortUsageNewestFirst(recs)
+	seen := map[string]bool{}
+	var out []string
+	for _, rec := range recs {
+		if rec.Model == "" {
+			continue
+		}
+		name := rec.AgentName()
+		if agentID == "codex" {
+			if name != "codex" && name != callerForModelRanking && name != "magpie-codex" {
+				continue
+			}
+		} else if agentID != "" && name != agentID {
+			continue
+		}
+		if seen[rec.Model] {
+			continue
+		}
+		seen[rec.Model] = true
+		out = append(out, rec.Model)
+		if len(out) == 100 {
+			break
+		}
+	}
+	return out
+}
+
+const callerForModelRanking = "aigate-codex"
+
 func agentError(w http.ResponseWriter, err error) int {
 	code := agent.CodeOf(err)
 	switch code {
 	case "not_found":
 		respond.Error(w, http.StatusNotFound, "not_found")
 		return http.StatusNotFound
-	case "no_models", "not_listening", "unknown", "absent", "unsupported", "not_connected", "id_taken":
+	case "no_models", "no_credential", "not_listening", "unknown", "absent", "unsupported", "not_connected", "id_taken":
 		respond.Error(w, http.StatusConflict, code)
 		return http.StatusConflict
 	default:

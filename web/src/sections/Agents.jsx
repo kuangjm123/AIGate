@@ -14,6 +14,7 @@ const agentState = {
 
 function agentError(err) {
   switch (err.message) {
+    case "no_credential": return "远程接入需要一把网关令牌。先在网关令牌页创建一个，再接入。";
     case "no_models": return "还没有可提供的模型。先添加提供方或路由，再接入。";
     case "not_listening": return "网关没有在监听，没有改应用的配置。";
     case "unknown": return "应用的配置读不出来，没有改它。";

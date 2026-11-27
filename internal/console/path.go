@@ -14,6 +14,9 @@ func IsModelPath(path string) bool {
 	if path == "/v1beta" || strings.HasPrefix(path, "/v1beta/") {
 		return true
 	}
+	if path == "/backend-api/codex" || strings.HasPrefix(path, "/backend-api/codex/") {
+		return true
+	}
 	if strings.HasPrefix(path, "/models/") {
 		return true
 	}

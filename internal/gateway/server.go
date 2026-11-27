@@ -93,6 +93,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) int {
 		return http.StatusServiceUnavailable
 	}
 	if r.Method == http.MethodGet {
+		if proto == ProtoCodex {
+			s.writeCodexCatalog(w, snap.Config, admitted, r.URL.Query().Get("kind"))
+			return http.StatusOK
+		}
 		writeCatalog(w, proto, snap.Config, admitted.allow, r.URL.Query().Get("kind"), s.loginEntries(r.URL.Query().Get("kind")))
 		return http.StatusOK
 	}

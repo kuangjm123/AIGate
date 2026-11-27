@@ -1301,13 +1301,20 @@ func (s *Server) remember(session, providerID string) {
 }
 
 func callContext(r *http.Request, parsed Parsed) CallContext {
+	agent := strings.TrimSpace(r.Header.Get("x-aigate-agent"))
+	if agent == "" {
+		switch strings.TrimSpace(r.Header.Get("x-openai-actor-authorization")) {
+		case "aigate", "magpie":
+			agent = "codex"
+		}
+	}
 	return CallContext{
 		Protocol: parsed.Protocol,
 		Model:    parsed.Model,
 		Stream:   parsed.Stream,
 		Path:     r.URL.Path,
 		Origin:   requestOrigin(r),
-		Agent:    strings.TrimSpace(r.Header.Get("x-aigate-agent")),
+		Agent:    agent,
 		Session:  sessionHeader(r),
 		Kind:     kindHeader(r),
 	}
