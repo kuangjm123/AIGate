@@ -260,6 +260,124 @@ func TestEligibleOmittedAndEmpty(t *testing.T) {
 	}
 }
 
+func TestRouteRoundTripsRoutingAndWeights(t *testing.T) {
+	var route Route
+	raw := `{"id":"r","modelMatch":"m","providerIds":["a","b"],"routing":"weight","weights":{"a":3,"b":1}}`
+	if err := json.Unmarshal([]byte(raw), &route); err != nil {
+		t.Fatal(err)
+	}
+	if route.Routing != "weight" || route.Weights["a"] != 3 || route.Weights["b"] != 1 {
+		t.Fatalf("route %+v", route)
+	}
+	b, err := json.Marshal(route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"routing":"weight"`) || !strings.Contains(string(b), `"weights":{"a":3,"b":1}`) {
+		t.Fatalf("marshal = %s", b)
+	}
+	plain, err := json.Marshal(Route{ID: "r", ModelMatch: "m", ProviderIDs: []string{}})
+	if err != nil || strings.Contains(string(plain), "routing") || strings.Contains(string(plain), "weights") {
+		t.Fatalf("default route wrote strategy fields: %s %v", plain, err)
+	}
+}
+
+func TestUnknownRoutingAndBadWeightRejected(t *testing.T) {
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Routes = []Route{{ID: "r", ModelMatch: "m", ProviderIDs: []string{"a"}, Routing: "bogus"}}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("unknown routing err = %v", Validate(cfg))
+	}
+	cfg.Routes[0].Routing = "weight"
+	cfg.Routes[0].Weights = map[string]int{"other": 2}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("non-member weight err = %v", Validate(cfg))
+	}
+	cfg.Routes[0].Weights = map[string]int{"a": 2}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("valid weight err = %v", err)
+	}
+}
+
+func TestGroupRoundTripsAndResolvesMembers(t *testing.T) {
+	var group Group
+	raw := `{"id":"team","members":["a/m","inner"],"routing":"cheap","weights":{"a/m":2},"eligible":[]}`
+	if err := json.Unmarshal([]byte(raw), &group); err != nil {
+		t.Fatal(err)
+	}
+	if group.ID != "team" || len(group.Members) != 2 || group.Routing != "cheap" ||
+		group.Weights["a/m"] != 2 || !group.EligibleSet || len(group.Eligible) != 0 {
+		t.Fatalf("group %+v", group)
+	}
+	b, err := json.Marshal(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"eligible":[]`) || !strings.Contains(string(b), `"weights":{"a/m":2}`) {
+		t.Fatalf("marshal = %s", b)
+	}
+
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Groups = []Group{
+		{ID: "team", Members: []string{"a/m", "inner"}},
+		{ID: "inner", Members: []string{"a/m"}},
+	}
+	if got, ok := cfg.GroupFor("group/team"); !ok || got.ID != "team" {
+		t.Fatalf("group alias %+v %v", got, ok)
+	}
+	if member, ok := cfg.ResolveGroupMember("inner"); !ok || !member.Nested || member.GroupID != "inner" {
+		t.Fatalf("nested member %+v %v", member, ok)
+	}
+	if member, ok := cfg.ResolveGroupMember("a/m"); !ok || member.ProviderID != "a" || member.Model != "m" {
+		t.Fatalf("provider member %+v %v", member, ok)
+	}
+}
+
+func TestGroupValidationRejectsBadMembersCyclesAndRouteOnlyStrategies(t *testing.T) {
+	cfg := emptyConfig()
+	cfg.Providers = []Provider{{ID: "a", BaseURL: "https://api.example.com", Credential: "k", Models: []string{"m"}}}
+	cfg.Groups = []Group{{ID: "g", Members: []string{"a/m"}, Routing: "cheap"}}
+	if err := Validate(cfg); err != nil {
+		t.Fatalf("group cheap err = %v", err)
+	}
+	cfg.Routes = []Route{{ID: "r", ModelMatch: "m", ProviderIDs: []string{"a"}, Routing: "cheap"}}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("route cheap err = %v", Validate(cfg))
+	}
+	cfg.Routes = nil
+	cfg.Groups[0].Members = []string{"missing/m"}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "group" {
+		t.Fatalf("missing member err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Members = []string{"g"}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "group" {
+		t.Fatalf("cycle err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Members = []string{"a/m"}
+	cfg.Groups[0].Weights = map[string]int{"other": 1}
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "routing" {
+		t.Fatalf("group weight err = %v", Validate(cfg))
+	}
+	cfg.Groups[0].Weights = nil
+	cfg.Groups = append(cfg.Groups, Group{ID: "g", Members: []string{"a/m"}})
+	if ve, ok := AsValidation(Validate(cfg)); !ok || ve.Reason != "duplicate_id" {
+		t.Fatalf("duplicate group err = %v", Validate(cfg))
+	}
+}
+
+func TestNegativeSpendLimitRejected(t *testing.T) {
+	cfg := emptyConfig()
+	neg := -1.0
+	cfg.GatewayTokens = []GatewayToken{{ID: "t", Secret: "secret-secret", SpendLimit: &neg}}
+	err := Validate(cfg)
+	ve, ok := AsValidation(err)
+	if !ok || ve.Reason != "spend_limit" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestSameListenRejected(t *testing.T) {
 	cfg := emptyConfig()
 	cfg.Listeners.Gateway = "127.0.0.1:8081"
@@ -393,6 +511,136 @@ func TestBadUsageLineIsUnknown(t *testing.T) {
 	}
 }
 
+func TestUsagePartialLineIsLeft(t *testing.T) {
+	s := openTemp(t)
+	if err := os.MkdirAll(s.Paths().UsageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	good := `{"routeId":"r","providerId":"p","outcome":"success","started":"2026-01-02T00:00:00Z","finished":"2026-01-02T00:00:01Z"}`
+	writeRaw(t, s.usageFile(), []byte(good+"\n"+`{"routeId":"cut"`))
+	recs, err := s.ReadUsage(UsageFilter{})
+	if err != nil || len(recs) != 1 || recs[0].RouteID != "r" {
+		t.Fatalf("recs=%v err=%v", recs, err)
+	}
+	writeRaw(t, s.usageFile(), []byte(`{"routeId":"cut"`))
+	recs, err = s.ReadUsage(UsageFilter{})
+	if err != nil || len(recs) != 0 {
+		t.Fatalf("partial recs=%v err=%v", recs, err)
+	}
+	writeRaw(t, s.usageFile(), []byte(good+"\n{not json}\n"))
+	if _, err := s.ReadUsage(UsageFilter{}); !errors.Is(err, ErrUsageUnknown) {
+		t.Fatal(err)
+	}
+}
+
+func TestUsageCountsRoundTrip(t *testing.T) {
+	s := openTemp(t)
+	start := time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	finish := start.Add(1500 * time.Millisecond)
+	cases := []struct {
+		usage string
+		want  UsageCounts
+	}{
+		{`{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":1}}`, UsageCounts{In: 6, Out: 3, CacheRead: 4, Reasoning: 1}},
+		{`{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}`, UsageCounts{In: 10, Out: 3, CacheRead: 4, CacheWrite: 2}},
+		{`{"promptTokenCount":8,"candidatesTokenCount":2,"cachedContentTokenCount":5,"thoughtsTokenCount":1}`, UsageCounts{In: 3, Out: 2, CacheRead: 5, Reasoning: 1}},
+	}
+	for i, tc := range cases {
+		err := s.AppendUsage(AttemptRecord{
+			RouteID: "r", ProviderID: "p", Outcome: "http_201",
+			Started: start, Finished: finish, Usage: json.RawMessage(tc.usage),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.ReadUsage(UsageFilter{})
+		if err != nil || len(got) != i+1 {
+			t.Fatalf("read %v %v", got, err)
+		}
+		last := got[len(got)-1]
+		if last.Counts() != tc.want || last.Status != 201 || last.MS != 1500 {
+			t.Fatalf("got %+v counts %+v", last, last.Counts())
+		}
+		b, err := json.Marshal(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `"cacheWrite":`) || !strings.Contains(string(b), `"in":`) {
+			t.Fatalf("counts omitted: %s", b)
+		}
+	}
+	err := s.AppendUsage(AttemptRecord{
+		RouteID: "total", ProviderID: "p", Outcome: "success",
+		Started: start, Finished: start, Usage: json.RawMessage(`{"total_tokens":3}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReadUsage(UsageFilter{RouteID: "total"})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("total %v %v", got, err)
+	}
+	b, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"in"`) || got[0].Counts() != (UsageCounts{}) {
+		t.Fatalf("total-only counted: %s", b)
+	}
+}
+
+func TestUsageSummarySkipsYesterday(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, loc)
+	today, ok := PeriodStart("today", now)
+	week, weekOK := PeriodStart("7d", now)
+	month, monthOK := PeriodStart("30d", now)
+	all, allOK := PeriodStart("all", now)
+	if !ok || !weekOK || !monthOK || !allOK || !all.IsZero() {
+		t.Fatal("period")
+	}
+	if !today.Equal(time.Date(2026, 6, 15, 0, 0, 0, 0, loc)) || !week.Equal(time.Date(2026, 6, 9, 0, 0, 0, 0, loc)) || !month.Equal(time.Date(2026, 5, 17, 0, 0, 0, 0, loc)) {
+		t.Fatalf("today %s week %s month %s", today, week, month)
+	}
+	if _, bad := PeriodStart("year", now); bad {
+		t.Fatal("year accepted")
+	}
+	s := openTemp(t)
+	oldUsage := json.RawMessage(`{"prompt_tokens":100,"completion_tokens":1}`)
+	if err := s.AppendUsage(AttemptRecord{RouteID: "old", ProviderID: "p", Outcome: "success", Started: today.Add(-time.Minute), Finished: today, Usage: oldUsage}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendUsage(AttemptRecord{RouteID: "new", ProviderID: "p", Outcome: "success", Started: today, Finished: today.Add(time.Second), Usage: json.RawMessage(`{"input_tokens":8,"output_tokens":2,"input_tokens_details":{"cached_tokens":3}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ReadUsage(UsageFilter{Start: &today})
+	if err != nil || len(got) != 1 || got[0].RouteID != "new" {
+		t.Fatalf("today %v %v", got, err)
+	}
+	sum := SummarizeUsage(got)
+	if sum.Calls != 1 || sum.In != 5 || sum.Out != 2 || sum.CacheRead != 3 {
+		t.Fatalf("summary %+v", sum)
+	}
+	allRecs, err := s.ReadUsage(UsageFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allSum := SummarizeUsage(allRecs)
+	if allSum.Calls != 2 || allSum.In != 105 {
+		t.Fatalf("all %+v", allSum)
+	}
+	file, err := os.ReadFile(s.usageFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := `{"routeId":"raw","providerId":"p","outcome":"success","started":"2026-06-15T01:00:00Z","finished":"2026-06-15T01:00:00Z","usage":{"prompt_tokens":9,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":2}}}` + "\n"
+	writeRaw(t, s.usageFile(), append(file, []byte(raw)...))
+	withRaw, err := s.ReadUsage(UsageFilter{RouteID: "raw"})
+	if err != nil || len(withRaw) != 1 || withRaw[0].Counts() != (UsageCounts{In: 7, Out: 1, CacheRead: 2}) {
+		t.Fatalf("raw %+v %v", withRaw, err)
+	}
+}
+
 func TestAttemptUsageOmitsMissingCounts(t *testing.T) {
 	b, err := json.Marshal(AttemptRecord{RouteID: "r", Outcome: "success", Started: time.Unix(0, 0).UTC(), Finished: time.Unix(0, 0).UTC()})
 	if err != nil {
@@ -400,6 +648,15 @@ func TestAttemptUsageOmitsMissingCounts(t *testing.T) {
 	}
 	if strings.Contains(string(b), "prompt_tokens") || strings.Contains(string(b), `"usage"`) {
 		t.Fatalf("missing usage stored as a value: %s", b)
+	}
+}
+
+func TestConfigCloneCopiesRouteWeights(t *testing.T) {
+	original := Config{Routes: []Route{{ID: "r", Weights: map[string]int{"p1": 2}}}}
+	cloned := original.Clone()
+	cloned.Routes[0].Weights["p1"] = 9
+	if original.Routes[0].Weights["p1"] != 2 {
+		t.Fatalf("clone shares route weights: %+v", original.Routes[0].Weights)
 	}
 }
 

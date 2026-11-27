@@ -34,6 +34,10 @@ const (
 	CodeBaseURL = "base_url"
 	// CodeUnknown means the attempt could not be classified.
 	CodeUnknown = "unknown"
+	// CodeSpendLimit means this gateway token has reached its dollar cap.
+	CodeSpendLimit = "spend_limit"
+	// CodePriceUnknown means the token has a cap and the price list could not be read.
+	CodePriceUnknown = "price_unknown"
 	// OutcomeSuccess is the usage outcome of a completed reply.
 	OutcomeSuccess = "success"
 )
@@ -133,19 +137,77 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 	if len(route.ProviderIDs) == 0 {
 		return Result{Code: CodeNoProvider, Status: http.StatusBadGateway}, nil
 	}
+	requestStart := time.Now().UTC()
+	requestID, _ := state.NewID()
+	if requestID == "" {
+		requestID = route.ID
+	}
 	view := PublicView(snap.Config)
-	var last Result
-	for _, providerID := range route.ProviderIDs {
-		if err := ctx.Err(); err != nil {
-			return last, err
+	appendFailed := false
+	store := func(rec state.AttemptRecord) bool {
+		failed := note(ctx, appendUsage, hooks, view, rec, nil)
+		if failed {
+			appendFailed = true
 		}
+		return failed
+	}
+	notify := func(rec state.AttemptRecord) {
+		note(ctx, nil, hooks, view, rec, nil)
+	}
+	attempts := 0
+	tries := func() int {
+		if attempts > 1 {
+			return attempts
+		}
+		return 0
+	}
+	type attempt struct {
+		providerID string
+		model      string
+		outcome    string
+		status     int
+		started    time.Time
+		usage      json.RawMessage
+		errText    string
+		errType    string
+		rejected   bool
+	}
+	sentModel := func(item attempt) string {
+		if item.model != "" {
+			return item.model
+		}
+		return model
+	}
+	final := func(item attempt, res Result) (Result, error) {
+		rec := state.AttemptRecord{
+			RouteID: requestID, Route: route.ID, ProviderID: item.providerID,
+			Outcome: item.outcome, Status: item.status, Started: requestStart,
+			Finished: time.Now().UTC(), Usage: cloneRaw(item.usage),
+			Model: sentModel(item), Err: item.errText, ErrType: item.errType, Rejected: item.rejected,
+			Tries: tries(),
+		}
+		if store(rec) {
+			res.AppendFailed = true
+		}
+		res.AppendFailed = res.AppendFailed || appendFailed
+		return res, nil
+	}
+	var last Result
+	var lastAttempt attempt
+	for i, providerID := range route.ProviderIDs {
+		more := i < len(route.ProviderIDs)-1
+		if err := ctx.Err(); err != nil {
+			item := attempt{providerID: lastAttempt.providerID, model: sentModel(lastAttempt), outcome: "canceled", status: 499, started: requestStart, errText: state.CanceledText, errType: "agent_canceled"}
+			res := Result{Code: "canceled", Status: 499}
+			res, _ = final(item, res)
+			return res, err
+		}
+		attempts++
 		started := time.Now().UTC()
-		routeID := route.ID
 		prov, pok := snap.Config.Provider(providerID)
 		if !pok {
-			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
-			return res, nil
+			item := attempt{providerID: providerID, model: model, outcome: CodeUnknown, status: http.StatusBadGateway, started: started, errText: CodeUnknown, rejected: true}
+			return final(item, Result{Code: CodeUnknown, Status: http.StatusBadGateway})
 		}
 		fields := Fields{Model: model}
 		reject := ""
@@ -160,36 +222,49 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 				break
 			}
 		}
+		sent := fields.Model
+		if sent == "" {
+			sent = model
+		}
 		if reject != "" {
-			res := Result{Code: reject, Status: statusFor(reject)}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, reject, started, nil), nil)
+			item := attempt{providerID: providerID, model: sent, outcome: reject, status: statusFor(reject), started: started, rejected: true}
+			if item.status == 0 {
+				item.status = http.StatusBadGateway
+			}
+			item.errText = reject
 			if route.Allows(state.ErrorClass(reject)) {
-				last = res
+				if more {
+					notify(state.AttemptRecord{
+						RouteID: requestID, Route: route.ID, ProviderID: providerID,
+						Outcome: reject, Status: item.status, Started: started,
+						Finished: time.Now().UTC(), Model: sent, Err: reject, Rejected: true,
+					})
+				}
+				lastAttempt = item
+				last = Result{Code: reject, Status: item.status}
 				continue
 			}
-			return res, nil
+			return final(item, Result{Code: reject, Status: item.status})
 		}
 		switch security.CheckBaseURL(prov.BaseURL, consoleListen, "") {
 		case security.BaseOK:
 		case security.BaseUnknown:
-			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
-			return res, nil
+			item := attempt{providerID: providerID, model: sent, outcome: CodeUnknown, status: http.StatusBadGateway, started: started, errText: CodeUnknown, rejected: true}
+			return final(item, Result{Code: CodeUnknown, Status: http.StatusBadGateway})
 		default:
-			res := Result{Code: CodeBaseURL, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeBaseURL, started, nil), nil)
-			return res, nil
+			item := attempt{providerID: providerID, model: sent, outcome: CodeBaseURL, status: http.StatusBadGateway, started: started, errText: CodeBaseURL, rejected: true}
+			return final(item, Result{Code: CodeBaseURL, Status: http.StatusBadGateway})
 		}
 		resp, err := dialer.Dial(ctx, DialRequest{
-			RouteID:    routeID,
+			RouteID:    route.ID,
 			ProviderID: providerID,
 			Credential: prov.Credential,
 			BaseURL:    prov.BaseURL,
 			Fields:     fields,
 		})
 		if err != nil && ctx.Err() != nil {
-			res := Result{Code: CodeUnknown, Status: http.StatusBadGateway}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, CodeUnknown, started, nil), nil)
+			item := attempt{providerID: providerID, model: sent, outcome: "canceled", status: 499, started: requestStart, errText: state.CanceledText, errType: "agent_canceled"}
+			res, _ := final(item, Result{Code: "canceled", Status: 499})
 			return res, ctx.Err()
 		}
 		if err != nil {
@@ -201,33 +276,75 @@ func Run(ctx context.Context, snap *state.Snapshot, model, consoleListen string,
 			if status == 0 {
 				status = http.StatusOK
 			}
+			outcome := OutcomeSuccess
+			if status < 200 || status >= 300 {
+				outcome = classifyStatus(status)
+				if outcome == "" {
+					outcome = "http_" + itoa(status)
+				}
+			}
+			rec := state.AttemptRecord{
+				RouteID: requestID, Route: route.ID, ProviderID: providerID,
+				Outcome: outcome, Status: status, Started: requestStart,
+				Finished: time.Now().UTC(), Usage: cloneRaw(resp.Usage), Model: sent, Tries: tries(),
+			}
 			res := Result{Status: status, Body: body}
-			res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, OutcomeSuccess, started, cloneRaw(resp.Usage)), body)
+			if outcome != OutcomeSuccess {
+				res.Code = outcome
+			}
+			if note(ctx, appendUsage, hooks, view, rec, body) || appendFailed {
+				res.AppendFailed = true
+			}
 			return res, nil
 		}
 		class := resp.Class
 		if class == "" {
 			class = string(state.ClassUpstreamUnavailable)
 		}
-		res := Result{Code: class, Status: statusFor(class)}
-		res.AppendFailed = note(ctx, appendUsage, hooks, view, record(routeID, providerID, class, started, cloneRaw(resp.Usage)), nil)
+		status := resp.Status
+		if status == 0 {
+			status = statusFor(class)
+		}
+		item := attempt{providerID: providerID, model: sent, outcome: class, status: status, started: started, usage: cloneRaw(resp.Usage), errText: class}
 		if route.Allows(state.ErrorClass(class)) {
-			last = res
+			if more {
+				if total := usageTokens(resp.Usage); total > 0 {
+					store(state.AttemptRecord{
+						RouteID: requestID, Route: route.ID, ProviderID: providerID,
+						Outcome: class, Status: status, Started: started,
+						Finished: time.Now().UTC(), Usage: cloneRaw(resp.Usage),
+						Model: sent, HandedOn: true, Err: class,
+					})
+				} else {
+					notify(state.AttemptRecord{
+						RouteID: requestID, Route: route.ID, ProviderID: providerID,
+						Outcome: class, Status: status, Started: started,
+						Finished: time.Now().UTC(), Model: sent, Err: class,
+					})
+				}
+			}
+			lastAttempt = item
+			last = Result{Code: class, Status: status}
 			continue
 		}
-		return res, nil
+		return final(item, Result{Code: class, Status: status})
 	}
 	if last.Code == "" {
 		last = Result{Code: CodeNoProvider, Status: http.StatusBadGateway}
 	}
-	return last, nil
+	item := lastAttempt
+	if item.providerID == "" {
+		item = attempt{model: model, outcome: CodeNoProvider, status: http.StatusBadGateway, started: requestStart, errText: CodeNoProvider, rejected: true}
+	}
+	return final(item, last)
 }
 
-func record(routeID, providerID, outcome string, started time.Time, usage json.RawMessage) state.AttemptRecord {
+func record(routeID, providerID, outcome string, status int, started time.Time, usage json.RawMessage) state.AttemptRecord {
 	return state.AttemptRecord{
 		RouteID:    routeID,
 		ProviderID: providerID,
 		Outcome:    outcome,
+		Status:     status,
 		Started:    started,
 		Finished:   time.Now().UTC(),
 		Usage:      usage,

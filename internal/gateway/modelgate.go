@@ -8,6 +8,12 @@ import (
 
 // gateModel reports a refusal code, or empty when the name may be attempted.
 func gateModel(cfg state.Config, model string, allow []string) string {
+	if group, ok := cfg.GroupFor(model); ok {
+		if !state.AllowsModel(allow, model, group.ID) {
+			return CodeModelDenied
+		}
+		return ""
+	}
 	if _, ok := cfg.RouteByModel(model); ok {
 		if !state.AllowsModel(allow, model, "") {
 			return CodeModelDenied

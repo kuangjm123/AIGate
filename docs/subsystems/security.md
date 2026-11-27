@@ -18,7 +18,7 @@ A model response from the current process is `config_unreadable`, `auth_failure`
 
 A console response masks secrets, as [console](console.md) describes. [security.AccessLine](../../internal/security/security.go) is the only request line written: method, path, and status. The query, the `Authorization` header, and the body are not part of it.
 
-The process does not send telemetry, and it does not add a relay, reseller, or affiliate address. No code path dials an address of its own.
+The process does not send telemetry, and it does not add a relay, reseller, or affiliate address. It dials these kinds of address besides a provider's model URL. `GET https://models.dev/api.json` reads list prices and carries no key. A saved DeepSeek base URL is also asked with `GET /user/balance` on that origin, using that provider's own key, when the usage page reads balances. A redirect is not followed. A failed balance read is unknown, not zero. A host with no balance API is not dialed. When the usage page reads subscription quotas, a Codex sign-in is asked at `https://chatgpt.com/backend-api/wham/usage` with that sign-in's own token, and a Gemini CLI or Antigravity sign-in is asked at `https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` (Antigravity also `retrieveUserQuotaSummary`) with its own access token. A Claude sign-in is never sent to Anthropic for its quota; the local `claude` binary answers `/usage` itself. A failed quota read is unknown, not zero.
 
 ## Plugins
 

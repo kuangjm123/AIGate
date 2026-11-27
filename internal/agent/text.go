@@ -100,11 +100,20 @@ func tomlTable(line string) (string, bool) {
 		return "", false
 	}
 	s := strings.TrimSpace(body)
-	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+	if len(s) < 2 || s[0] != '[' || s[len(s)-1] != ']' {
 		return "", false
 	}
 	if strings.HasPrefix(s, "[[") {
+		if len(s) < 4 || !strings.HasSuffix(s, "]]") {
+			return s, true
+		}
+		if parts, ok := tomlKeyParts(s[2 : len(s)-2]); ok && len(parts) > 0 {
+			return "[[" + strings.Join(parts, ".") + "]]", true
+		}
 		return s, true
+	}
+	if parts, ok := tomlKeyParts(s[1 : len(s)-1]); ok && len(parts) > 0 {
+		return strings.Join(parts, "."), true
 	}
 	return strings.TrimSpace(s[1 : len(s)-1]), true
 }
@@ -118,15 +127,15 @@ func tomlAssign(line string) (string, string, bool) {
 	if raw == "" || strings.HasPrefix(raw, "[") {
 		return "", "", false
 	}
-	key, value, found := strings.Cut(raw, "=")
+	at, found := topLevelByte(raw, '=')
 	if !found {
 		return "", "", false
 	}
-	key = strings.TrimSpace(key)
-	if !tomlKey(key) {
+	parts, ok := tomlKeyParts(strings.TrimSpace(raw[:at]))
+	if !ok || len(parts) == 0 || parts[0] == "" {
 		return "", "", false
 	}
-	return key, strings.TrimSpace(value), true
+	return strings.Join(parts, "."), strings.TrimSpace(raw[at+1:]), true
 }
 
 func tomlKey(key string) bool {
@@ -140,6 +149,80 @@ func tomlKey(key string) bool {
 		return false
 	}
 	return true
+}
+
+func tomlKeyParts(raw string) ([]string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, false
+	}
+	var parts []string
+	for {
+		s = strings.TrimLeft(s, " \t")
+		if s == "" {
+			return nil, false
+		}
+		if s[0] == '"' || s[0] == '\'' {
+			end, ok := tomlKeyEnd(s)
+			if !ok {
+				return nil, false
+			}
+			name, ok := tomlString(s[:end])
+			if !ok {
+				return nil, false
+			}
+			parts = append(parts, name)
+			s = strings.TrimLeft(s[end:], " \t")
+		} else {
+			i := 0
+			for i < len(s) && tomlBareKeyByte(s[i]) {
+				i++
+			}
+			if i == 0 {
+				return nil, false
+			}
+			parts = append(parts, s[:i])
+			s = strings.TrimLeft(s[i:], " \t")
+		}
+		if s == "" {
+			break
+		}
+		if s[0] != '.' {
+			return nil, false
+		}
+		s = s[1:]
+		if strings.TrimSpace(s) == "" {
+			return nil, false
+		}
+	}
+	return parts, true
+}
+
+func tomlKeyEnd(s string) (int, bool) {
+	quote := s[0]
+	escaped := false
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if quote == '"' && escaped {
+			escaped = false
+			continue
+		}
+		if quote == '"' && c == '\\' {
+			escaped = true
+			continue
+		}
+		if c == quote {
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+func tomlBareKeyByte(c byte) bool {
+	if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+		return true
+	}
+	return c == '_' || c == '-'
 }
 
 func tomlString(raw string) (string, bool) {

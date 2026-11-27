@@ -2,6 +2,7 @@ package state
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 )
@@ -40,4 +41,25 @@ func FreshID(used []string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("id space exhausted")
+}
+
+// KeyFingerprint is a short, non-reversible name for an upstream key. It is
+// what a usage line stores as providerKeyId; the key itself is never written.
+func KeyFingerprint(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:8])
+}
+
+// ProviderSeatKey is the stable name of one provider key seat. It is built
+// from the non-reversible fingerprint, never from the key itself.
+func ProviderSeatKey(providerID, key string) string {
+	return "provider/" + providerID + "/key/" + KeyFingerprint(key)
+}
+
+// LoginSeatKey is the stable name of one subscription account seat.
+func LoginSeatKey(account string) string {
+	return "login/" + account
 }

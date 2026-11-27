@@ -116,6 +116,10 @@ func TestUnavailableFallsThroughAndAuthDoesNot(t *testing.T) {
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "second") || first.Load() != 1 || second.Load() != 1 {
 		t.Fatalf("fallback %d %s hits %d %d", rr.Code, rr.Body.String(), first.Load(), second.Load())
 	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || recs[0].Status != http.StatusOK || recs[0].Outcome != OutcomeSuccess || recs[0].ProviderID != "p2" || recs[0].Tries != 2 || recs[0].RouteID == "" {
+		t.Fatalf("fallback usage %+v %v", recs, err)
+	}
 
 	var blocked atomic.Int32
 	denied := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +138,156 @@ func TestUnavailableFallsThroughAndAuthDoesNot(t *testing.T) {
 	rr = callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
 	if rr.Code != http.StatusUnauthorized || !strings.Contains(rr.Body.String(), "auth_failure") || blocked.Load() != 0 {
 		t.Fatalf("auth stop %d %s blocked %d", rr.Code, rr.Body.String(), blocked.Load())
+	}
+	deniedRecs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(deniedRecs) != 1 || deniedRecs[0].Outcome != string(state.ClassAuthFailure) || deniedRecs[0].Status != http.StatusUnauthorized {
+		t.Fatalf("auth usage %+v %v", deniedRecs, err)
+	}
+}
+
+func TestFallbackWithBilledFailureWritesHandedOn(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy","usage":{"prompt_tokens":10,"completion_tokens":3}}`))
+	}))
+	defer down.Close()
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"second"}}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`))
+	}))
+	defer okSrv.Close()
+	store, secret := dialStore(t, []state.Provider{
+		{ID: "p1", Protocol: "chat", BaseURL: down.URL, Models: []string{"demo"}, Credential: "k1"},
+		{ID: "p2", Protocol: "chat", BaseURL: okSrv.URL, Models: []string{"demo"}, Credential: "k2"},
+	}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1", "p2"}}})
+	rr := callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "second") {
+		t.Fatalf("fallback %d %s", rr.Code, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+	if recs[0].RouteID == "" || recs[0].RouteID != recs[1].RouteID {
+		t.Fatalf("route ids %q %q", recs[0].RouteID, recs[1].RouteID)
+	}
+	if !recs[0].HandedOn || recs[0].Outcome != string(state.ClassUpstreamUnavailable) {
+		t.Fatalf("handed on %+v", recs[0])
+	}
+	if recs[1].HandedOn || recs[1].ProviderID != "p2" || recs[1].Tries != 2 || recs[1].Outcome != OutcomeSuccess {
+		t.Fatalf("final %+v", recs[1])
+	}
+	summary := state.SummarizeUsage(recs)
+	if summary.Calls != 1 || summary.Failed != 0 || summary.In != 15 || summary.Out != 5 {
+		t.Fatalf("summary %+v", summary)
+	}
+}
+
+func TestCanceledRequestIsNotAFailure(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"demo","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	ctx, cancel := context.WithCancel(req.Context())
+	cancel()
+	req = req.WithContext(ctx)
+	rr := httptest.NewRecorder()
+	(&Server{Store: store}).ServeHTTP(rr, req)
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || !recs[0].Canceled() || recs[0].Status != 499 {
+		t.Fatalf("canceled usage %+v %v", recs, err)
+	}
+	summary := state.SummarizeUsage(recs)
+	if summary.Calls != 1 || summary.Canceled != 1 || summary.Failed != 0 {
+		t.Fatalf("canceled summary %+v", summary)
+	}
+}
+
+func TestBilledFailureOnTheLastCandidateIsTheFinalRow(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy","usage":{"prompt_tokens":10,"completion_tokens":3}}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	rr := callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d %s", rr.Code, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || recs[0].HandedOn || !recs[0].Failed() {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+	if got := recs[0].Counts(); got.In != 10 || got.Out != 3 {
+		t.Fatalf("counts %+v", got)
+	}
+	summary := state.SummarizeUsage(recs)
+	if summary.Calls != 1 || summary.Failed != 1 || summary.In != 10 || summary.Out != 3 {
+		t.Fatalf("summary %+v", summary)
+	}
+}
+
+func TestUsageLineStoresCounts(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":1}}}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	rr := callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reply %d %s", rr.Code, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("usage %v %v", recs, err)
+	}
+	got := recs[0].Counts()
+	if recs[0].Status != http.StatusOK || got.In != 6 || got.Out != 3 || got.CacheRead != 4 || got.CacheWrite != 0 || got.Reasoning != 1 {
+		t.Fatalf("line %+v counts %+v", recs[0], got)
+	}
+	if recs[0].BytesIn == 0 || recs[0].BytesOut == 0 || recs[0].TTFTMS != 0 {
+		t.Fatalf("line bytes %+v", recs[0])
+	}
+	b, err := json.Marshal(recs[0])
+	if err != nil || !bytes.Contains(b, []byte(`"cacheWrite":0`)) {
+		t.Fatalf("zero cache write omitted: %s", b)
+	}
+}
+
+func TestUsageLineStoresTheModelSentToTheProvider(t *testing.T) {
+	var sent string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var doc struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&doc)
+		sent = doc.Model
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, nil)
+	rr := callGateway(t, &Server{Store: store}, secret, http.MethodPost, "/v1/chat/completions",
+		`{"model":"p1/demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK || sent != "demo" {
+		t.Fatalf("reply %d sent %q body %s", rr.Code, sent, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || recs[0].Model != "demo" {
+		t.Fatalf("usage %+v %v", recs, err)
 	}
 }
 
@@ -188,7 +342,9 @@ func TestTryRewriteDoesNotReachTheNextProvider(t *testing.T) {
 		mu.Lock()
 		seen["p1"] = doc.Model
 		mu.Unlock()
-		http.Error(w, "no", http.StatusServiceUnavailable)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"busy","usage":{"prompt_tokens":7,"completion_tokens":2}}`))
 	}))
 	defer down.Close()
 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,6 +366,135 @@ func TestTryRewriteDoesNotReachTheNextProvider(t *testing.T) {
 	rr := callGateway(t, srv, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
 	if rr.Code != http.StatusOK || seen["p1"] != "p1-only" || seen["p2"] != "demo" {
 		t.Fatalf("rewrite %d p1 %q p2 %q", rr.Code, seen["p1"], seen["p2"])
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+	if !recs[0].HandedOn || recs[0].Model != "p1-only" {
+		t.Fatalf("handed on %+v", recs[0])
+	}
+	if recs[1].HandedOn || recs[1].Model != "demo" || recs[1].Outcome != OutcomeSuccess {
+		t.Fatalf("final %+v", recs[1])
+	}
+}
+
+func TestTryRewriteIsTheModelOnTheFinalUsageLine(t *testing.T) {
+	var sent string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var doc struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&doc)
+		sent = doc.Model
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	srv := &Server{Store: store, Middleware: []Middleware{tryMW{}}}
+	rr := callGateway(t, srv, secret, http.MethodPost, "/v1/chat/completions", `{"model":"demo","messages":[{"role":"user","content":"hi"}]}`)
+	if rr.Code != http.StatusOK || sent != "p1-only" {
+		t.Fatalf("rewrite %d sent %q body %s", rr.Code, sent, rr.Body.String())
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || recs[0].Model != "p1-only" {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+}
+
+func TestCanceledTryRewriteIsTheModelOnTheCanceledUsageLine(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+	}))
+	defer up.Close()
+	defer close(release)
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"demo"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "demo", ProviderIDs: []string{"p1"}}})
+	srv := &Server{Store: store, Middleware: []Middleware{tryMW{}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"demo","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	ctx, cancel := context.WithCancel(req.Context())
+	req = req.WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		srv.ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not finish the canceled request")
+	}
+	recs, err := store.ReadUsage(state.UsageFilter{})
+	if err != nil || len(recs) != 1 || !recs[0].Canceled() || recs[0].Model != "p1-only" {
+		t.Fatalf("usage %+v %v", recs, err)
+	}
+}
+
+func TestCanceledBeforeRoutingWritesOneCanceledLine(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(*syncHook, chan struct{}) *Server
+	}{
+		{
+			name: "hook",
+			start: func(hook *syncHook, started chan struct{}) *Server {
+				hook.started = started
+				return &Server{Hooks: []RequestHook{hook}}
+			},
+		},
+		{
+			name: "middleware",
+			start: func(_ *syncHook, started chan struct{}) *Server {
+				return &Server{Middleware: []Middleware{&syncMiddleware{started: started}}}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := loadTemp(t)
+			hook := &syncHook{}
+			started := make(chan struct{})
+			srv := tc.start(hook, started)
+			srv.Store = store
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"demo","messages":[{"role":"user","content":"hi"}]}`))
+			ctx, cancel := context.WithCancel(req.Context())
+			req = req.WithContext(ctx)
+			done := make(chan int, 1)
+			go func() {
+				done <- srv.serveModel(httptest.NewRecorder(), req, store.Current(), ProtoChat, admission{caller: "tok", tokenID: "tok"})
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request stage did not start")
+			}
+			cancel()
+			select {
+			case status := <-done:
+				if status != 499 {
+					t.Fatalf("status %d", status)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("gateway did not finish the canceled request")
+			}
+			recs, err := store.ReadUsage(state.UsageFilter{})
+			if err != nil || len(recs) != 1 || !recs[0].Canceled() || recs[0].ProviderID != "" || recs[0].Model != "demo" {
+				t.Fatalf("usage %+v %v", recs, err)
+			}
+		})
 	}
 }
 
@@ -626,5 +911,35 @@ func (tryMW) OnTry(_ context.Context, body json.RawMessage, _ CallContext, provi
 	return next
 }
 func (tryMW) OnReply(_ context.Context, status int, body json.RawMessage, _ CallContext) (int, json.RawMessage) {
+	return status, body
+}
+
+type syncHook struct {
+	started chan struct{}
+}
+
+func (h *syncHook) OnRequest(ctx context.Context, _ json.RawMessage, _ CallContext) (json.RawMessage, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*syncHook) OnResponse(context.Context, json.RawMessage, CallContext, bool) {}
+
+type syncMiddleware struct {
+	started chan struct{}
+}
+
+func (m *syncMiddleware) OnRequest(ctx context.Context, _ json.RawMessage, _ CallContext) (json.RawMessage, *Reject) {
+	close(m.started)
+	<-ctx.Done()
+	return nil, nil
+}
+
+func (*syncMiddleware) OnTry(context.Context, json.RawMessage, CallContext, string, Protocol) json.RawMessage {
+	return nil
+}
+
+func (*syncMiddleware) OnReply(_ context.Context, status int, body json.RawMessage, _ CallContext) (int, json.RawMessage) {
 	return status, body
 }

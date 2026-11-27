@@ -4,6 +4,7 @@
 package login
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"strings"
@@ -63,6 +64,13 @@ type Machine struct {
 	// WorkBuddyAPI and WorkBuddyAI replace the personal origins. An enterprise domain still uses its own host.
 	WorkBuddyAPI string
 	WorkBuddyAI  string
+	// ChatGPT is the ChatGPT backend origin that serves /wham/usage. Empty means chatgpt.com.
+	ChatGPT string
+	// CloudCode and AntiCloud replace the Google quota hosts. Empty means the public hosts.
+	CloudCode string
+	AntiCloud string
+	// ClaudeUsage runs claude -p /usage. A test supplies one. Nil runs the local binary.
+	ClaudeUsage func(ctx context.Context, home string) ([]byte, error)
 }
 
 func (m Machine) client() *http.Client {

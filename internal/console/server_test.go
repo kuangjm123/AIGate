@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/price"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -116,6 +118,159 @@ func TestExplicitEmptyEligible(t *testing.T) {
 	}
 }
 
+func TestRouteCarriesRoutingAndWeights(t *testing.T) {
+	store := loadTemp(t)
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{ID: "p", Name: "P", Protocol: "chat", BaseURL: "https://api.example.com", Models: []string{"m"}, Credential: "k"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	route := postJSON(t, srv.URL+"/routes", token, map[string]any{
+		"modelMatch": "m", "providerIds": []string{"p"}, "routing": "weight", "weights": map[string]int{"p": 2},
+	})
+	if route["routing"] != "weight" {
+		t.Fatalf("created %#v", route)
+	}
+	listed := mustGET(t, srv.URL+"/routes", token)
+	if !strings.Contains(listed, `"routing":"weight"`) || !strings.Contains(listed, `"weights":{"p":2}`) {
+		t.Fatalf("list %s", listed)
+	}
+	res, body := do(t, http.MethodPut, srv.URL+"/routes/"+route["id"].(string), token, []byte(`{"modelMatch":"m","providerIds":["p"],"routing":"rotate"}`))
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `"routing":"rotate"`) || strings.Contains(body, "weights") {
+		t.Fatalf("put %d %s", res.StatusCode, body)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/routes", token, []byte(`{"modelMatch":"x","providerIds":["p"],"routing":"bogus"}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "routing") {
+		t.Fatalf("bad routing %d %s", res.StatusCode, body)
+	}
+}
+
+func TestGroupCRUDAndReferences(t *testing.T) {
+	store := loadTemp(t)
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{
+			{ID: "p1", Name: "One", Protocol: "chat", BaseURL: "https://one.example.com", Models: []string{"m"}, Credential: "k1"},
+			{ID: "p2", Name: "Two", Protocol: "chat", BaseURL: "https://two.example.com", Models: []string{"m"}, Credential: "k2"},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+
+	group := postJSON(t, srv.URL+"/groups", token, map[string]any{
+		"id": "strong", "members": []string{"p1/m", "p2/m"}, "routing": "cheap",
+	})
+	if group["id"] != "strong" || group["routing"] != "cheap" {
+		t.Fatalf("created %#v", group)
+	}
+	listed := mustGET(t, srv.URL+"/groups", token)
+	if !strings.Contains(listed, `"id":"strong"`) || !strings.Contains(listed, `"members":["p1/m","p2/m"]`) {
+		t.Fatalf("list %s", listed)
+	}
+	res, body := do(t, http.MethodPut, srv.URL+"/groups/strong", token, []byte(`{"members":["p1/m","p2/m"],"routing":"weight","weights":{"p1/m":3,"p2/m":1}}`))
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `"routing":"weight"`) || !strings.Contains(body, `"p1/m":3`) {
+		t.Fatalf("put %d %s", res.StatusCode, body)
+	}
+	res, body = do(t, http.MethodDelete, srv.URL+"/providers/p1", token, nil)
+	if res.StatusCode != http.StatusConflict || !strings.Contains(body, "in_use") {
+		t.Fatalf("provider in group %d %s", res.StatusCode, body)
+	}
+
+	nested := postJSON(t, srv.URL+"/groups", token, map[string]any{
+		"id": "team/outer", "members": []string{"strong"}, "routing": "order",
+	})
+	if nested["id"] != "team/outer" {
+		t.Fatalf("nested %#v", nested)
+	}
+	res, body = do(t, http.MethodDelete, srv.URL+"/groups/"+url.PathEscape("team/outer"), token, nil)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete nested %d %s", res.StatusCode, body)
+	}
+
+	res, body = do(t, http.MethodDelete, srv.URL+"/groups/strong", token, nil)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete group %d %s", res.StatusCode, body)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/routes", token, []byte(`{"modelMatch":"m","providerIds":["p1"],"routing":"cheap"}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "routing") {
+		t.Fatalf("route cheap %d %s", res.StatusCode, body)
+	}
+}
+
+func TestProviderSeatLimitsAndReset(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	var gotScope, gotSeat string
+	srv := httptest.NewServer(&Server{
+		Store: store, Host: memHost{store: store},
+		ResetSeat: func(scope, seat string) {
+			gotScope, gotSeat = scope, seat
+		},
+	})
+	defer srv.Close()
+
+	provider := postJSON(t, srv.URL+"/providers", token, map[string]any{
+		"name": "limited", "protocol": "chat", "baseUrl": "https://api.example.com",
+		"models": []string{"m"}, "credentials": []string{"secret-one", "secret-two"},
+		"maxConcurrent": 2, "maxRPM": 60, "queueSlots": 3, "queueWaitMS": 500,
+	})
+	for key, want := range map[string]float64{"maxConcurrent": 2, "maxRPM": 60, "queueSlots": 3, "queueWaitMS": 500} {
+		if provider[key] != want {
+			t.Fatalf("%s = %v, want %v (%#v)", key, provider[key], want, provider)
+		}
+	}
+	seats := mustGET(t, srv.URL+"/seats", token)
+	if strings.Contains(seats, "secret-one") || strings.Contains(seats, "secret-two") {
+		t.Fatalf("seat list leaked a key: %s", seats)
+	}
+	if !strings.Contains(seats, `"kind":"key"`) || !strings.Contains(seats, `"keyIndex":1`) {
+		t.Fatalf("seats %s", seats)
+	}
+	id := provider["id"].(string)
+	res, body := do(t, http.MethodPost, srv.URL+"/seats/reset", token, []byte(`{"scope":"r1","seat":"provider/`+id+`/key/abc"}`))
+	if res.StatusCode != http.StatusNoContent || gotScope != "r1" || gotSeat != "provider/"+id+"/key/abc" {
+		t.Fatalf("reset %d %s scope=%q seat=%q", res.StatusCode, body, gotScope, gotSeat)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/seats/reset", token, []byte(`{"seat":"nope"}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "seat") {
+		t.Fatalf("bad seat %d %s", res.StatusCode, body)
+	}
+
+	res, body = do(t, http.MethodPut, srv.URL+"/providers/"+id, token, []byte(`{"name":"limited","protocol":"chat","baseUrl":"https://api.example.com","models":["m"],"maxConcurrent":0,"maxRPM":0,"queueSlots":0,"queueWaitMS":0}`))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("put %d %s", res.StatusCode, body)
+	}
+	snap := store.Current()
+	saved, ok := snap.Config.Provider(id)
+	if !ok || saved.MaxConcurrent != 0 || saved.MaxRPM != 0 || saved.QueueSlots != 0 || saved.QueueWaitMS != 0 {
+		t.Fatalf("limits not cleared: %#v", saved)
+	}
+}
+
+func TestAutoGroupsSwitch(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	if body := mustGET(t, srv.URL+"/auto-groups", token); !strings.Contains(body, `"on":true`) {
+		t.Fatalf("default %s", body)
+	}
+	res, body := do(t, http.MethodPut, srv.URL+"/auto-groups", token, []byte(`{"on":false}`))
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `"on":false`) {
+		t.Fatalf("off %d %s", res.StatusCode, body)
+	}
+	if !store.Current().Config.NoAutoGroups {
+		t.Fatal("auto groups not stored as off")
+	}
+}
+
 func TestUsageReadDoesNotAppend(t *testing.T) {
 	store := loadTemp(t)
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
@@ -140,6 +295,158 @@ func TestUsageReadDoesNotAppend(t *testing.T) {
 	after := mustGET(t, srv.URL+"/usage", token)
 	if before != after {
 		t.Fatal("console appended usage")
+	}
+}
+
+func TestTokenSpendLimitIsStored(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	created := postJSON(t, srv.URL+"/tokens", token, map[string]any{"spendLimit": 2.5, "spendPeriod": "today"})
+	if created["spendPeriod"] != "today" || created["spendLimit"] != 2.5 {
+		t.Fatalf("created %#v", created)
+	}
+	listed := mustGET(t, srv.URL+"/tokens", token)
+	if !strings.Contains(listed, `"spendLimit":2.5`) || !strings.Contains(listed, `"spendPeriod":"today"`) {
+		t.Fatalf("list %s", listed)
+	}
+	res, body := do(t, http.MethodPost, srv.URL+"/tokens", token, []byte(`{"spendLimit":-1}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "spend_limit") {
+		t.Fatalf("negative %d %s", res.StatusCode, body)
+	}
+}
+
+func TestCreatedTokenReturnsModels(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	created := postJSON(t, srv.URL+"/tokens", token, map[string]any{"models": []string{"m1", "m2"}})
+	models, _ := created["models"].([]any)
+	if len(models) != 2 || models[0] != "m1" || models[1] != "m2" {
+		t.Fatalf("created %#v", created)
+	}
+	listed := mustGET(t, srv.URL+"/tokens", token)
+	if !strings.Contains(listed, `"models":["m1","m2"]`) {
+		t.Fatalf("list %s", listed)
+	}
+}
+
+func TestUsageSummaryPricesTheWindow(t *testing.T) {
+	store := loadTemp(t)
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "r", ProviderID: "p", Outcome: "success", Model: "demo",
+		Started: time.Now().UTC(), Finished: time.Now().UTC(),
+		Usage: json.RawMessage(`{"prompt_tokens":1000000,"completion_tokens":500000}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{
+		Store: store, Host: memHost{store: store},
+		Prices: price.Fixed{"demo": {Input: 2, Output: 8}},
+	})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage?period=all", token)
+	if !strings.Contains(body, `"cost":6`) || !strings.Contains(body, `"unpriced":0`) {
+		t.Fatalf("priced %s", body)
+	}
+}
+
+func TestUsageBalanceDoesNotDialAnUnknownHost(t *testing.T) {
+	store := loadTemp(t)
+	key := "sk-test-secret"
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{
+			ID: "p", Name: "OpenAI", Protocol: "chat", BaseURL: "https://api.openai.com/v1",
+			Models: []string{"gpt-4o"}, Credential: key,
+		}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", session)
+	if strings.Contains(body, key) || !strings.Contains(body, `"providerId":"p"`) || !strings.Contains(body, `"status":"unsupported"`) || strings.Contains(body, `"remaining"`) {
+		t.Fatalf("balance %s", body)
+	}
+}
+
+func TestUsageQuotasReadTheSubscriptionSignIns(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := "secret-token"
+	if err := os.WriteFile(filepath.Join(home, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"`+secret+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}, Logins: func() login.Machine {
+		return login.Machine{Home: home, ClaudeUsage: func(context.Context, string) ([]byte, error) {
+			return []byte("Current session: 13% used\nResets 4pm\n"), nil
+		}}
+	}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(body, `"quotas":[{"account":"claude"`) || !strings.Contains(body, `"usedPercent":13`) || !strings.Contains(body, `"resetText":"4pm"`) {
+		t.Fatalf("quotas %s", body)
+	}
+	if strings.Contains(body, secret) {
+		t.Fatal("usage response contains the token")
+	}
+}
+
+func TestUsageQuotasWithoutLoginsIsEmpty(t *testing.T) {
+	store := loadTemp(t)
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(body, `"quotas":[]`) {
+		t.Fatalf("quotas %s", body)
+	}
+}
+
+func TestUsageSummaryUsesLocalToday(t *testing.T) {
+	store := loadTemp(t)
+	now := time.Now()
+	start, ok := state.PeriodStart("today", now)
+	if !ok {
+		t.Fatal("today")
+	}
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "old", ProviderID: "p", Outcome: "success",
+		Started: start.Add(-time.Minute), Finished: start,
+		Usage: json.RawMessage(`{"prompt_tokens":100,"completion_tokens":1}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendUsage(state.AttemptRecord{
+		RouteID: "new", ProviderID: "p", Outcome: "success",
+		Started: start, Finished: start.Add(time.Second),
+		Usage: json.RawMessage(`{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":4}}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	body := mustGET(t, srv.URL+"/usage?period=today", token)
+	if strings.Contains(body, `"routeId":"old"`) || !strings.Contains(body, `"routeId":"new"`) || !strings.Contains(body, `"calls":1`) || !strings.Contains(body, `"in":6`) || !strings.Contains(body, `"cacheRead":4`) {
+		t.Fatalf("today %s", body)
+	}
+	res, bad := do(t, http.MethodGet, srv.URL+"/usage?period=year", token, nil)
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(bad, "invalid") {
+		t.Fatalf("bad period %d %s", res.StatusCode, bad)
+	}
+	allBody := mustGET(t, srv.URL+"/usage", token)
+	if !strings.Contains(allBody, `"summary"`) || !strings.Contains(allBody, `"calls":2`) {
+		t.Fatalf("all %s", allBody)
 	}
 }
 

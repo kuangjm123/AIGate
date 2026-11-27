@@ -32,7 +32,12 @@ func offers() []Model {
 
 func mustStatus(t *testing.T, m Machine, id string) Status {
 	t.Helper()
-	for _, st := range Inspect(m, gw()) {
+	return statusFor(t, m, gw(), id)
+}
+
+func statusFor(t *testing.T, m Machine, target Target, id string) Status {
+	t.Helper()
+	for _, st := range Inspect(m, target) {
 		if st.ID == id {
 			return st
 		}
@@ -44,6 +49,7 @@ func mustStatus(t *testing.T, m Machine, id string) Status {
 func TestOffersSkipHiddenAndNonChat(t *testing.T) {
 	cfg := state.Config{
 		Routes: []state.Route{{ID: "r", ModelMatch: "routed"}},
+		Groups: []state.Group{{ID: "g", Members: []string{"p/chat"}}},
 		Providers: []state.Provider{{
 			ID: "p", Models: []string{"routed", "chat", "pic", "gone"},
 			Info: []state.ModelInfo{
@@ -53,7 +59,7 @@ func TestOffersSkipHiddenAndNonChat(t *testing.T) {
 		}},
 	}
 	got := Offers(cfg)
-	if len(got) != 2 || got[0].ID != "routed" || got[1].ID != "p/chat" || got[1].Bare != "chat" {
+	if len(got) != 3 || got[0].ID != "routed" || got[1].ID != "group/g" || got[1].Bare != "g" || got[2].ID != "p/chat" || got[2].Bare != "chat" {
 		t.Fatalf("offers %#v", got)
 	}
 }
@@ -232,8 +238,15 @@ func TestCodexConnectLeavesOtherTablesAndRestoresTheLine(t *testing.T) {
 	if !strings.Contains(text, "model = \"p1/demo\"") || !strings.Contains(text, "[model_providers.aigate]") || !strings.Contains(text, "experimental_bearer_token = \"aigate-codex\"") {
 		t.Fatalf("wiring missing\n%s", text)
 	}
-	if !strings.Contains(text, "base_url = \"http://127.0.0.1:3425/v1\"") || !strings.Contains(text, "wire_api = \"responses\"") {
+	wantCatalog := codexCatalogRef(m, codexCatalogPath(m))
+	if !strings.Contains(text, "base_url = \"http://127.0.0.1:3425/v1\"") || !strings.Contains(text, "wire_api = \"responses\"") || !strings.Contains(text, "model_catalog_json = \""+wantCatalog+"\"") || strings.Contains(text, "requires_openai_auth") {
 		t.Fatalf("provider table\n%s", text)
+	}
+	if !strings.Contains(text, "http_headers = { \"x-openai-actor-authorization\" = \"aigate\" }") || !strings.Contains(text, "openai_base_url = \"http://127.0.0.1:3425/backend-api/codex\"") {
+		t.Fatalf("codex headers\n%s", text)
+	}
+	if !exists(codexCatalogPath(m)) {
+		t.Fatal("catalog was not written")
 	}
 	text = strings.Replace(text, "[notice]\nhide = true", "[notice]\nhide = true\npersonality = \"pragmatic\"", 1)
 	writeFile(t, path, text)
@@ -244,8 +257,884 @@ func TestCodexConnectLeavesOtherTablesAndRestoresTheLine(t *testing.T) {
 	if !strings.Contains(text, "model = \"mine\" # mine") || !strings.Contains(text, "model_provider = \"openai\"") {
 		t.Fatalf("lines not restored\n%s", text)
 	}
-	if strings.Contains(text, "model_providers.aigate") || !strings.Contains(text, "personality = \"pragmatic\"") || !strings.Contains(text, "# keep") {
+	if !strings.Contains(text, "[model_providers.aigate]") || !strings.Contains(text, "personality = \"pragmatic\"") || !strings.Contains(text, "# keep") {
 		t.Fatalf("disconnect\n%s", text)
+	}
+	if strings.Contains(text, "openai_base_url") {
+		t.Fatalf("gateway base URL left behind\n%s", text)
+	}
+	if exists(codexCatalogPath(m)) {
+		t.Fatal("generated catalog left behind")
+	}
+}
+
+func TestCodexCatalogAndProviderSettings(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"old\"\nmodel_reasoning_effort = \"xhigh\"\n")
+	vision := true
+	models := []Model{{
+		ID: "p1/reasoner", Name: "Reasoner", Context: 128000, Reasoning: true, Vision: &vision,
+	}}
+	if err := Connect(m, "codex", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, "model_provider = \"aigate\"") || !strings.Contains(text, "model = \"p1/reasoner\"") {
+		t.Fatalf("top-level\n%s", text)
+	}
+	catalog := readDoc(t, codexCatalogPath(m))
+	list, _ := catalog["models"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("catalog %#v", catalog)
+	}
+	entry, _ := list[0].(map[string]any)
+	if entry["slug"] != "p1/reasoner" || entry["default_reasoning_level"] != "xhigh" || entry["context_window"] != json.Number("128000") {
+		t.Fatalf("entry %#v", entry)
+	}
+	mods, _ := entry["input_modalities"].([]any)
+	if len(mods) != 2 || mods[1] != "image" {
+		t.Fatalf("modalities %#v", mods)
+	}
+}
+
+func TestCodexKeepsUserBaseURLTokenAndHeaders(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	orig := `model = "mine"
+openai_base_url = "https://example.test/custom"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-shared"
+requires_openai_auth = false
+http_headers = { "x-org" = "acme" }
+
+[model_providers.aigate.http_headers]
+"x-extra" = "kept"
+`
+	writeFile(t, path, orig)
+	if err := Connect(m, "codex", gw(), offers()); CodeOf(err) != "unknown" {
+		t.Fatalf("conflicting header forms %v", err)
+	}
+	if readString(t, path) != orig {
+		t.Fatalf("conflicting file changed\n%s", readString(t, path))
+	}
+	writeFile(t, path, `model = "mine"
+openai_base_url = "https://example.test/custom"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-shared"
+requires_openai_auth = false
+
+[model_providers.aigate.http_headers]
+"x-org" = "acme"
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, "experimental_bearer_token = \"aigate-shared\"") || !strings.Contains(text, "requires_openai_auth = false") {
+		t.Fatalf("user provider values lost\n%s", text)
+	}
+	if !strings.Contains(text, "openai_base_url = \"https://example.test/custom\"") || strings.Contains(text, "backend-api/codex") {
+		t.Fatalf("user base URL changed\n%s", text)
+	}
+	if !strings.Contains(text, `"x-org" = "acme"`) || !strings.Contains(text, `"x-openai-actor-authorization" = "aigate"`) {
+		t.Fatalf("user headers lost\n%s", text)
+	}
+	if strings.Count(text, "[model_providers.aigate.http_headers]") != 1 || strings.Count(text, "http_headers =") != 0 {
+		t.Fatalf("duplicate headers\n%s", text)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	text = readString(t, path)
+	if !strings.Contains(text, "openai_base_url = \"https://example.test/custom\"") || !strings.Contains(text, "[model_providers.aigate.http_headers]") {
+		t.Fatalf("disconnect changed user values\n%s", text)
+	}
+}
+
+func TestCodexRestoresAGatewayBaseURLItFound(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	const base = "http://127.0.0.1:3425/backend-api/codex"
+	writeFile(t, path, "model = \"mine\"\nopenai_base_url = \""+base+"\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `openai_base_url = "`+base+`"`) {
+		t.Fatalf("the base URL the user already had was removed\n%s", text)
+	}
+}
+
+func TestCodexInlineHeadersKeepOtherHeaders(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+http_headers = { "x-org" = "acme", "x-second" = "two" }
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, `"x-org" = "acme"`) || !strings.Contains(text, `"x-second" = "two"`) || !strings.Contains(text, `"x-openai-actor-authorization" = "aigate"`) {
+		t.Fatalf("inline headers lost\n%s", text)
+	}
+}
+
+func TestCodexDottedHeadersKeepOtherHeaders(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+http_headers."x-org" = "acme"
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, `http_headers."x-org" = "acme"`) || !strings.Contains(text, `http_headers.x-openai-actor-authorization = "aigate"`) {
+		t.Fatalf("dotted headers lost\n%s", text)
+	}
+	if strings.Contains(text, "http_headers =") {
+		t.Fatalf("second header definition\n%s", text)
+	}
+}
+
+func TestCodexRemovesAuthTrueAndKeepsFalse(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+requires_openai_auth = true
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); strings.Contains(text, "requires_openai_auth") {
+		t.Fatalf("requires_openai_auth stayed\n%s", text)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); strings.Contains(text, "requires_openai_auth") {
+		t.Fatalf("requires_openai_auth came back\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+requires_openai_auth = false
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, "requires_openai_auth = false") {
+		t.Fatalf("user's false was removed\n%s", text)
+	}
+}
+
+func TestCodexKeepsOnlyCredentialsTheGatewayTakes(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "sk-issued"
+`)
+	gwWithKey := gw()
+	gwWithKey.Keys = []string{"sk-issued"}
+	if err := Connect(m, "codex", gwWithKey, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `experimental_bearer_token = "sk-issued"`) {
+		t.Fatalf("issued key was replaced\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "sk-user"
+`)
+	gwWithKey = gw()
+	gwWithKey.Keys = []string{"sk-issued"}
+	if err := Connect(m, "codex", gwWithKey, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `experimental_bearer_token = "sk-user"`) {
+		t.Fatalf("loopback credential was replaced\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+`)
+	remote := gw()
+	remote.Token = "shared-secret"
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `experimental_bearer_token = "shared-secret"`) {
+		t.Fatalf("remote connection kept a local caller name\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "sk-issued"
+`)
+	remote = gw()
+	remote.Token = "shared-secret"
+	remote.Keys = []string{"sk-issued"}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `experimental_bearer_token = "sk-issued"`) {
+		t.Fatalf("remote issued key was replaced\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	orig := `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "sk-user"
+`
+	writeFile(t, path, orig)
+	remote = Target{Origin: "http://192.0.2.10:3425"}
+	if err := Connect(m, "codex", remote, offers()); CodeOf(err) != "no_credential" {
+		t.Fatalf("remote without a token %v", err)
+	}
+	if text := readString(t, path); text != orig {
+		t.Fatalf("refused remote connect changed the file\n%s", text)
+	}
+	remote.Keys = []string{"sk-shared"}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `experimental_bearer_token = "sk-shared"`) || strings.Contains(text, `experimental_bearer_token = "aigate-codex"`) {
+		t.Fatalf("remote connection kept a local caller name\n%s", text)
+	}
+}
+
+func TestCodexStashDoesNotCopyARemoteToken(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	remote := Target{Origin: "http://192.0.2.10:3425", Token: "shared-secret"}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	stash := readString(t, stashPath(m, "codex"))
+	if strings.Contains(stash, "shared-secret") {
+		t.Fatalf("stash holds the remote token\n%s", stash)
+	}
+	if !strings.Contains(stash, secretDigest("shared-secret")) {
+		t.Fatalf("stash does not hold the token fingerprint\n%s", stash)
+	}
+}
+
+func TestCodexRemoteCatalogFollowsTheWrittenToken(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "sk-b"
+`)
+	remote := Target{
+		Origin: "http://192.0.2.10:3425",
+		Keys:   []string{"sk-a", "sk-b"},
+		Allowed: map[string][]string{
+			"sk-a": {"p1/demo"},
+			"sk-b": {"route"},
+		},
+	}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, `experimental_bearer_token = "sk-b"`) {
+		t.Fatalf("the table's accepted token was replaced\n%s", text)
+	}
+	if !strings.Contains(text, `model = "route"`) {
+		t.Fatalf("model does not follow the written token\n%s", text)
+	}
+	catalog := readDoc(t, codexCatalogPath(m))
+	list, _ := catalog["models"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("catalog was not filtered by the written token: %#v", catalog)
+	}
+	entry, _ := list[0].(map[string]any)
+	if entry["slug"] != "route" {
+		t.Fatalf("catalog kept a model the key cannot call: %#v", entry)
+	}
+}
+
+func TestCodexExplicitRemoteTokenFiltersTheCatalog(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	remote := Target{
+		Origin:  "http://192.0.2.10:3425",
+		Token:   "sk-shared",
+		Allowed: map[string][]string{"sk-shared": {"p1/demo"}},
+	}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	catalog := readDoc(t, codexCatalogPath(m))
+	list, _ := catalog["models"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("catalog %#v", catalog)
+	}
+	entry, _ := list[0].(map[string]any)
+	if entry["slug"] != "p1/demo" {
+		t.Fatalf("entry %#v", entry)
+	}
+}
+
+func TestCodexRemoteTokenWithNoModelWritesNothing(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	const orig = "model = \"mine\"\n"
+	writeFile(t, path, orig)
+	remote := Target{
+		Origin:  "http://192.0.2.10:3425",
+		Token:   "sk-shared",
+		Allowed: map[string][]string{"sk-shared": {"not/offered"}},
+	}
+	if err := Connect(m, "codex", remote, offers()); CodeOf(err) != "no_models" {
+		t.Fatalf("connect %v", err)
+	}
+	if text := readString(t, path); text != orig {
+		t.Fatalf("refused connect changed the config\n%s", text)
+	}
+	if exists(codexCatalogPath(m)) {
+		t.Fatal("refused connect wrote a catalog")
+	}
+	if exists(stashPath(m, "codex")) {
+		t.Fatal("refused connect wrote a note")
+	}
+}
+
+func TestCodexLeavesReasoningEffortToTheUser(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\nmodel_reasoning_effort = \"xhigh\"\n")
+	models := []Model{{ID: "p1/reasoner", Name: "Reasoner", Reasoning: true}}
+	if err := Connect(m, "codex", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, "model_reasoning_effort = \"xhigh\"") {
+		t.Fatalf("connect changed the effort\n%s", text)
+	}
+	text := readString(t, path)
+	text = strings.Replace(text, `model_reasoning_effort = "xhigh"`, `model_reasoning_effort = "low"`, 1)
+	writeFile(t, path, text)
+	if err := Connect(m, "codex", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	catalog := readDoc(t, codexCatalogPath(m))
+	list, _ := catalog["models"].([]any)
+	entry, _ := list[0].(map[string]any)
+	if entry["default_reasoning_level"] != "low" {
+		t.Fatalf("catalog did not follow the current effort %#v", entry)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, "model_reasoning_effort = \"low\"") {
+		t.Fatalf("disconnect restored the earlier effort\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, "model = \"mine\"\nmodel_reasoning_effort = \"xhigh\"\n")
+	if err := Connect(m, "codex", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	text = readString(t, path)
+	text = strings.Replace(text, "model_reasoning_effort = \"xhigh\"\n", "", 1)
+	writeFile(t, path, text)
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, "model_reasoning_effort = \"xhigh\"") {
+		t.Fatalf("disconnect did not put back the effort the user left empty\n%s", text)
+	}
+}
+
+func TestCodexRemoteCompactionCapability(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n\n[features]\nasync_compaction = true\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "v2" }`) {
+		t.Fatalf("background compaction has no capability\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n\n[features.async_compaction]\nenabled = true\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "v2" }`) {
+		t.Fatalf("table form has no capability\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, `model = "mine"
+
+[features]
+async_compaction = true
+
+[model_providers.aigate]
+name = "Mine"
+base_url = "http://old"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+capabilities = { remote_compaction = "unsupported" }
+`)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "unsupported" }`) {
+		t.Fatalf("user capability was replaced\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); strings.Contains(text, "capabilities") {
+		t.Fatalf("capability written without the feature\n%s", text)
+	}
+
+	for _, body := range []string{
+		"model = \"mine\"\nfeatures.async_compaction = true\n",
+		"model = \"mine\"\nfeatures = { async_compaction = true }\n",
+		"model = \"mine\"\n[features]\nasync_compaction = { enabled = true }\n",
+	} {
+		m = testMachine(t)
+		path = codexPath(m)
+		writeFile(t, path, body)
+		if err := Connect(m, "codex", gw(), offers()); err != nil {
+			t.Fatal(err)
+		}
+		if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "v2" }`) {
+			t.Fatalf("background compaction shape has no capability\n%s\n%s", body, text)
+		}
+	}
+}
+
+func TestCodexRemoteCompactionCapabilityFollowsTheFeature(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n\n[features]\nasync_compaction = true\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "v2" }`) {
+		t.Fatalf("capability was not written\n%s", text)
+	}
+	text := readString(t, path)
+	text = strings.Replace(text, "async_compaction = true", "async_compaction = false", 1)
+	writeFile(t, path, text)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); strings.Contains(text, "capabilities") {
+		t.Fatalf("AIGate's capability stayed after the feature went off\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n\n[features]\nasync_compaction = true\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text = readString(t, path)
+	text = strings.Replace(text, `capabilities = { remote_compaction = "v2" }`, `capabilities = { remote_compaction = "v2", custom = true }`, 1)
+	text = strings.Replace(text, "async_compaction = true", "async_compaction = false", 1)
+	writeFile(t, path, text)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `capabilities = { remote_compaction = "v2", custom = true }`) {
+		t.Fatalf("user capability was removed\n%s", text)
+	}
+
+	m = testMachine(t)
+	path = codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n\n[features]\nasync_compaction = true\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text = readString(t, path)
+	text = strings.Replace(text, "async_compaction = true", "async_compaction = false", 1)
+	writeFile(t, path, text)
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); strings.Contains(text, "capabilities") {
+		t.Fatalf("disconnect kept AIGate's capability after the feature went off\n%s", text)
+	}
+}
+
+func TestCodexMissingCatalogIsDriftAndReconnectRepairs(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(codexCatalogPath(m)); err != nil {
+		t.Fatal(err)
+	}
+	if st := mustStatus(t, m, "codex"); st.State != "drift" {
+		t.Fatalf("missing catalog state %#v", st)
+	}
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(codexCatalogPath(m)) {
+		t.Fatal("reconnect did not restore catalog")
+	}
+	if st := mustStatus(t, m, "codex"); st.State != "on" {
+		t.Fatalf("repaired state %#v", st)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if readString(t, path) == "" {
+		t.Fatal("config disappeared")
+	}
+}
+
+func TestCodexSyncRestoresAMissingCatalog(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := codexCatalogPath(m)
+	if err := os.Remove(catalogPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncCodex(m); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(catalogPath) {
+		t.Fatal("sync did not restore the catalog")
+	}
+	if st := mustStatus(t, m, "codex"); st.State != "on" {
+		t.Fatalf("repaired state %#v", st)
+	}
+}
+
+func TestCodexSyncRemovesADanglingCatalogKey(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	text = strings.Replace(text, `model_provider = "aigate"`, `model_provider = "openai"`, 1)
+	writeFile(t, path, text)
+	if err := SyncCodex(m); err != nil {
+		t.Fatal(err)
+	}
+	text = readString(t, path)
+	if strings.Contains(text, "model_catalog_json") {
+		t.Fatalf("dangling catalog key stayed\n%s", text)
+	}
+	if !strings.Contains(text, "[model_providers.aigate]") {
+		t.Fatalf("provider table was removed\n%s", text)
+	}
+}
+
+func TestCodexSyncDoesNotGuessFromAnUnreadableNote(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := codexCatalogPath(m)
+	if err := os.Remove(catalogPath); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, stashPath(m, "codex"), "{")
+	if err := SyncCodex(m); CodeOf(err) != "unknown" {
+		t.Fatalf("sync %v", err)
+	}
+	if exists(catalogPath) {
+		t.Fatal("sync wrote from an unreadable note")
+	}
+}
+
+func TestCodexKeepsUserCatalogFieldsAcrossReconnect(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := codexCatalogPath(m)
+	doc := readDoc(t, catalogPath)
+	list, _ := doc["models"].([]any)
+	entry, _ := list[0].(map[string]any)
+	entry["x_user"] = map[string]any{"keep": true}
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, catalogPath, string(body))
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	doc = readDoc(t, catalogPath)
+	list, _ = doc["models"].([]any)
+	entry, _ = list[0].(map[string]any)
+	if entry["x_user"] == nil {
+		t.Fatalf("user key lost %#v", entry)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(catalogPath) {
+		t.Fatal("catalog with user keys was removed")
+	}
+}
+
+func TestCodexRestoresTheCatalogItFound(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	catalogPath := codexCatalogPath(m)
+	original := `{
+  "x_owner": {"name": "user"},
+  "models": [
+    {"slug": "mine/only", "base_instructions": "mine", "x_note": 9007199254740993}
+  ]
+}
+`
+	writeFile(t, path, "model = \"mine\"\nmodel_catalog_json = \"mine-models.json\"\n")
+	writeFile(t, catalogPath, original)
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if readString(t, catalogPath) == original {
+		t.Fatal("connect did not write its own catalog")
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, catalogPath); text != original {
+		t.Fatalf("the catalog the user had was not restored\n%s", text)
+	}
+	if text := readString(t, path); !strings.Contains(text, `model_catalog_json = "mine-models.json"`) {
+		t.Fatalf("catalog reference was not restored\n%s", text)
+	}
+}
+
+func TestCodexKeepsTopLevelCatalogFieldsAcrossReconnect(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := codexCatalogPath(m)
+	doc := readDoc(t, catalogPath)
+	doc["x_owner"] = map[string]any{"name": "user"}
+	list, _ := doc["models"].([]any)
+	entry, _ := list[0].(map[string]any)
+	entry["x_entry"] = true
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, catalogPath, string(body))
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	doc = readDoc(t, catalogPath)
+	if doc["x_owner"] == nil {
+		t.Fatalf("top-level user key lost on reconnect %#v", doc)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	if !exists(catalogPath) {
+		t.Fatal("catalog with a top-level user key was removed")
+	}
+	if doc = readDoc(t, catalogPath); doc["x_owner"] == nil {
+		t.Fatalf("top-level user key lost on disconnect %#v", doc)
+	}
+}
+
+func TestCodexLegacyRecordKeepsTheCatalogItNeverStashed(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "p1/demo"
+model_provider = "aigate"
+model_catalog_json = "mine-models.json"
+
+[model_providers.aigate]
+name = "AIGate"
+base_url = "http://127.0.0.1:3425/v1"
+wire_api = "responses"
+experimental_bearer_token = "aigate-codex"
+`)
+	if err := saveRecord(m, "codex", record{
+		Fields: map[string]field{
+			"file":           {Present: true},
+			"model":          {Present: true, Value: "model = \"mine\""},
+			"model_provider": {Present: true, Value: "model_provider = \"openai\""},
+			"provider":       {Present: true, Value: "[model_providers.aigate]\nname = \"AIGate\""},
+		},
+		Written: map[string]string{
+			"model":                     "p1/demo",
+			"model_provider":            "aigate",
+			"base_url":                  "http://127.0.0.1:3425/v1",
+			"wire_api":                  "responses",
+			"experimental_bearer_token": "aigate-codex",
+			"name":                      "AIGate",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if st := mustStatus(t, m, "codex"); st.State != "drift" {
+		t.Fatalf("legacy wiring state %#v", st)
+	}
+	if err := Connect(m, "codex", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if text := readString(t, path); !strings.Contains(text, `model_catalog_json = "`+codexCatalogName+`"`) {
+		t.Fatalf("catalog was not wired\n%s", text)
+	}
+	if err := Disconnect(m, "codex"); err != nil {
+		t.Fatal(err)
+	}
+	text := readString(t, path)
+	if !strings.Contains(text, `model_catalog_json = "mine-models.json"`) || !strings.Contains(text, "model = \"mine\"") {
+		t.Fatalf("legacy catalog or model was not restored\n%s", text)
+	}
+}
+
+func TestCodexHandStatusNeedsACredentialTheGatewayTakes(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, `model = "p1/demo"
+model_provider = "aigate"
+
+[model_providers.aigate]
+name = "AIGate"
+base_url = "http://127.0.0.1:3425/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-never-issued"
+`)
+	if st := mustStatus(t, m, "codex"); st.State != "hand" {
+		t.Fatalf("loopback credential state %#v", st)
+	}
+	text := readString(t, path)
+	writeFile(t, path, strings.Replace(text, "sk-never-issued", "aigate-codex", 1))
+	if st := mustStatus(t, m, "codex"); st.State != "hand" {
+		t.Fatalf("loopback token state %#v", st)
+	}
+
+	writeFile(t, path, `model = "p1/demo"
+model_provider = "aigate"
+
+[model_providers.aigate]
+name = "AIGate"
+base_url = "http://192.0.2.10:3425/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-never-issued"
+`)
+	remote := Target{Origin: "http://192.0.2.10:3425"}
+	if st := statusFor(t, m, remote, "codex"); st.State != "off" {
+		t.Fatalf("remote unknown token state %#v", st)
+	}
+	remote.Keys = []string{"sk-never-issued"}
+	if st := statusFor(t, m, remote, "codex"); st.State != "hand" {
+		t.Fatalf("remote issued token state %#v", st)
+	}
+}
+
+func TestCodexConnectedStatusNeedsACredentialTheGatewayTakes(t *testing.T) {
+	m := testMachine(t)
+	writeFile(t, codexPath(m), "model = \"mine\"\n")
+	remote := Target{Origin: "http://192.0.2.10:3425", Keys: []string{"sk-live"}}
+	if err := Connect(m, "codex", remote, offers()); err != nil {
+		t.Fatal(err)
+	}
+	if st := statusFor(t, m, remote, "codex"); st.State != "on" {
+		t.Fatalf("connected state %#v", st)
+	}
+	remote.Keys = nil
+	if st := statusFor(t, m, remote, "codex"); st.State != "drift" {
+		t.Fatalf("revoked token state %#v", st)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -121,6 +122,65 @@ func TestSameListenOpensNeither(t *testing.T) {
 	}
 	if !bytes.Equal(raw, got) {
 		t.Fatalf("config changed:\n%s", got)
+	}
+}
+
+func TestShutdownRestoresCodex(t *testing.T) {
+	application, _ := start(t, state.Config{
+		Listeners: state.Listeners{Gateway: freeAddr(t), Console: freeAddr(t)},
+		Routes:    []state.Route{{ID: "route", ModelMatch: "demo"}},
+	}, nil)
+	home := t.TempDir()
+	machine := agent.Machine{
+		Home:     home,
+		StashDir: filepath.Join(t.TempDir(), "agents"),
+		LookPath: func(string) bool { return false },
+	}
+	application.EnableAgentWiring(machine)
+	codexConfig := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(codexConfig), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const original = "model = \"mine\"\n"
+	if err := os.WriteFile(codexConfig, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := consoleSession(t, application.ConsoleURL())
+	res, body := do(t, http.MethodPost, application.ConsoleURL()+"/agents/codex/connect", session, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("connect %d %s", res.StatusCode, body)
+	}
+	if got, err := os.ReadFile(codexConfig); err != nil || string(got) == original {
+		t.Fatalf("connect did not write Codex config: %q %v", got, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := application.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(codexConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, `model = "mine"`) {
+		t.Fatalf("model was not restored\n%s", text)
+	}
+	for _, key := range []string{"model_provider =", "model_catalog_json =", "openai_base_url ="} {
+		if strings.Contains(text, key) {
+			t.Fatalf("%s was left behind\n%s", key, text)
+		}
+	}
+	if !strings.Contains(text, "[model_providers.aigate]") {
+		t.Fatalf("provider table was removed\n%s", text)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "aigate-models.json")); !os.IsNotExist(err) {
+		t.Fatalf("generated catalog was left behind: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(machine.StashDir, "codex.json")); !os.IsNotExist(err) {
+		t.Fatalf("connection note was left behind: %v", err)
 	}
 }
 

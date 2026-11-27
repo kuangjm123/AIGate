@@ -148,6 +148,7 @@
 | 内容 | 文档 |
 | --- | --- |
 | 一次请求经过哪些部分 | [网关链路](gateway-chain.md) |
+| 这个仓库现在的用量边界 | [用量](usage.md) |
 | 应用怎样把请求发给网关 | [Integrating](integrating.md) |
 | 选路与备用 | [Gateway routing and fallback](subsystems/gateway-routing.md) |
 | 会话归并 | [Gateway Session Aggregation](subsystems/gateway-sessions.md) |

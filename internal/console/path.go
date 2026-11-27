@@ -14,6 +14,9 @@ func IsModelPath(path string) bool {
 	if path == "/v1beta" || strings.HasPrefix(path, "/v1beta/") {
 		return true
 	}
+	if path == "/backend-api/codex" || strings.HasPrefix(path, "/backend-api/codex/") {
+		return true
+	}
 	if strings.HasPrefix(path, "/models/") {
 		return true
 	}
@@ -23,7 +26,7 @@ func IsModelPath(path string) bool {
 // IsConsolePath reports a control route. The gateway rejects these and does not apply them.
 func IsConsolePath(path string) bool {
 	switch path {
-	case "/", "/config-status", "/register", "/login", "/logout", "/providers", "/routes", "/plugins", "/plugins/order", "/tokens", "/usage", "/listeners", "/conversations", "/conversations/turns", "/agents", "/accounts", "/accounts/discovery", "/accounts/workbuddy":
+	case "/", "/config-status", "/register", "/login", "/logout", "/providers", "/routes", "/plugins", "/plugins/order", "/tokens", "/pricing", "/usage", "/usage/heatmap", "/usage/requests.csv", "/usage/traffic", "/usage/requests/content", "/usage/clear", "/listeners", "/conversations", "/conversations/turns", "/agents", "/accounts", "/accounts/discovery", "/accounts/workbuddy":
 		return true
 	}
 	if rest, ok := strings.CutPrefix(path, "/agents/"); ok && rest != "" {

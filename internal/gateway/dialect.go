@@ -22,11 +22,12 @@ const (
 	ProtoAnthropic Protocol = "anthropic"
 	ProtoGemini    Protocol = "gemini"
 	ProtoOllama    Protocol = "ollama"
+	ProtoCodex     Protocol = "codex"
 )
 
 // Classify reports the dialect of an application request.
-// A catalog read is reported as chat, responses' list, ollama, or gemini
-// according to the path. Other methods and paths are not dialects.
+// A catalog read is reported as chat, codex, ollama, or gemini according to
+// the path. Other methods and paths are not dialects.
 // An application whose base URL is only the gateway origin appends the path
 // its own SDK uses, so the version prefix is optional: /chat/completions is
 // chat, /responses is responses, and /messages is anthropic.
@@ -40,6 +41,8 @@ func Classify(r *http.Request) (Protocol, bool) {
 		switch p {
 		case "/v1/models", "/models":
 			return ProtoChat, true
+		case "/v1/codex/models", "/backend-api/codex/models":
+			return ProtoCodex, true
 		case "/api/tags":
 			return ProtoOllama, true
 		case "/v1beta/models":
@@ -54,7 +57,7 @@ func Classify(r *http.Request) (Protocol, bool) {
 	switch p {
 	case "/v1/chat/completions", "/chat/completions":
 		return ProtoChat, true
-	case "/v1/responses", "/responses":
+	case "/v1/responses", "/responses", "/backend-api/codex/responses":
 		return ProtoResponses, true
 	case "/v1/messages", "/messages":
 		return ProtoAnthropic, true
@@ -635,6 +638,11 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 			routed[route.ModelMatch] = true
 		}
 	}
+	for _, group := range cfg.Groups {
+		if group.ID != "" {
+			routed[group.ID] = true
+		}
+	}
 	seen := map[string]bool{}
 	var out []catalogEntry
 	add := func(entry catalogEntry) {
@@ -649,6 +657,12 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 		out = append(out, entry)
 	}
 	if kind == "chat" {
+		for _, group := range cfg.Groups {
+			if group.ID == "" {
+				continue
+			}
+			add(catalogEntry{ID: group.ID, Owner: group.ID, Bare: group.ID})
+		}
 		for _, route := range cfg.Routes {
 			owner := route.ID
 			if owner == "" {

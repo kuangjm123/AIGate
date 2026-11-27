@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+  <title id="title">一次模型请求的路径</title>
+  <desc id="desc">请求按路径认出协议，选中供应商或订阅，把回复翻回应用的协议，并记下用量。</desc>
+  <rect width="1200" height="240" rx="20" fill="#f5f7fb"/>
+
+  <rect x="48" y="48" width="240" height="144" rx="12" fill="#ffffff" stroke="#e5e9f0"/>
+  <text x="72" y="100" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">01</text>
+  <text x="72" y="146" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="24" font-weight="600">认出协议</text>
+  <path d="M300 120 H336" stroke="#c5cbe0" stroke-width="2"/>
+  <path d="M328 114 L340 120 L328 126" stroke="#4f46e5" stroke-width="2" fill="none"/>
+
+  <rect x="348" y="48" width="240" height="144" rx="12" fill="#ffffff" stroke="#e5e9f0"/>
+  <text x="372" y="100" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">02</text>
+  <text x="372" y="146" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="24" font-weight="600">选上游</text>
+  <path d="M600 120 H636" stroke="#c5cbe0" stroke-width="2"/>
+  <path d="M628 114 L640 120 L628 126" stroke="#4f46e5" stroke-width="2" fill="none"/>
+
+  <rect x="648" y="48" width="240" height="144" rx="12" fill="#ffffff" stroke="#4f46e5" stroke-width="1.5"/>
+  <text x="672" y="100" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">03</text>
+  <text x="672" y="146" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="24" font-weight="600">翻回协议</text>
+  <path d="M900 120 H936" stroke="#c5cbe0" stroke-width="2"/>
+  <path d="M928 114 L940 120 L928 126" stroke="#4f46e5" stroke-width="2" fill="none"/>
+
+  <rect x="948" y="48" width="204" height="144" rx="12" fill="#ffffff" stroke="#e5e9f0"/>
+  <text x="972" y="100" fill="#4f46e5" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="18" font-weight="700">04</text>
+  <text x="972" y="146" fill="#172033" font-family="Segoe UI, PingFang SC, Microsoft YaHei, sans-serif" font-size="24" font-weight="600">记用量</text>
+</svg>

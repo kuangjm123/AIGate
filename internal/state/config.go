@@ -3,6 +3,7 @@ package state
 import (
 	"encoding/json"
 	"strings"
+	"time"
 )
 
 // ErrorClass is one failure the gateway keeps separate from the others.
@@ -58,6 +59,33 @@ type Provider struct {
 	Info        []ModelInfo `json:"info,omitempty"`
 	Credential  string      `json:"credential,omitempty"`
 	Credentials []string    `json:"credentials,omitempty"`
+	// MaxConcurrent caps requests in flight on one key seat. Zero means no cap.
+	MaxConcurrent int `json:"maxConcurrent,omitempty"`
+	// MaxRPM caps request starts per minute on one key seat. Zero means no cap.
+	MaxRPM int `json:"maxRPM,omitempty"`
+	// QueueSlots caps how many requests may wait on a capped seat. Zero uses
+	// the process default.
+	QueueSlots int `json:"queueSlots,omitempty"`
+	// QueueWaitMS caps how long a request may wait for a capped seat. Zero
+	// uses the process default.
+	QueueWaitMS int `json:"queueWaitMS,omitempty"`
+	// Multiplier scales catalog prices for this provider. Nil or 1 is the
+	// catalog price. An explicit 0 makes this provider's calls free.
+	Multiplier *float64 `json:"multiplier,omitempty"`
+	// KeyMultipliers scales catalog prices for each upstream key, in the same
+	// order as Credentials. An absent list or a value of 1 keeps the catalog
+	// price. The provider multiplier and a key multiplier are not both applied
+	// to one call; the key's own value wins when it is present.
+	KeyMultipliers []float64 `json:"keyMultipliers,omitempty"`
+	// BalanceURL is a balance endpoint the user supplied for this provider.
+	// BalanceField is the dotted JSON path of the remaining amount in its
+	// reply. BalanceManual is an amount the user typed; it is shown when no
+	// endpoint answers and no earlier reading is kept. BalanceCurrency
+	// prefixes that amount.
+	BalanceURL      string `json:"balanceUrl,omitempty"`
+	BalanceField    string `json:"balanceField,omitempty"`
+	BalanceManual   string `json:"balanceManual,omitempty"`
+	BalanceCurrency string `json:"balanceCurrency,omitempty"`
 }
 
 // Keys returns the provider's upstream keys, credentials first, then a legacy
@@ -86,12 +114,17 @@ func (p Provider) Keys() []string {
 // Route matches a model name to an ordered provider list.
 // EligibleSet is false when the file omits eligible; the attempt loop then
 // uses only upstream unavailable. An explicit empty list stays empty.
+// Routing is the strategy ordering the providers: empty is smart, or order,
+// rotate, usage, pace, weight, free, fast, cheap, drain, expiring.
+// Weights is each provider's weight for the weight strategy; absent means 1.
 type Route struct {
-	ID          string       `json:"id"`
-	ModelMatch  string       `json:"modelMatch"`
-	ProviderIDs []string     `json:"providerIds"`
-	Eligible    []ErrorClass `json:"-"`
-	EligibleSet bool         `json:"-"`
+	ID          string         `json:"id"`
+	ModelMatch  string         `json:"modelMatch"`
+	ProviderIDs []string       `json:"providerIds"`
+	Routing     string         `json:"-"`
+	Weights     map[string]int `json:"-"`
+	Eligible    []ErrorClass   `json:"-"`
+	EligibleSet bool           `json:"-"`
 }
 
 // EligibleOrDefault returns the classes that may fall through to the next provider.
@@ -115,10 +148,12 @@ func (r Route) Allows(class ErrorClass) bool {
 }
 
 type routeJSON struct {
-	ID          string        `json:"id"`
-	ModelMatch  string        `json:"modelMatch"`
-	ProviderIDs []string      `json:"providerIds"`
-	Eligible    *[]ErrorClass `json:"eligible,omitempty"`
+	ID          string         `json:"id"`
+	ModelMatch  string         `json:"modelMatch"`
+	ProviderIDs []string       `json:"providerIds"`
+	Routing     string         `json:"routing,omitempty"`
+	Weights     map[string]int `json:"weights,omitempty"`
+	Eligible    *[]ErrorClass  `json:"eligible,omitempty"`
 }
 
 // MarshalJSON omits eligible when it was not set, and writes [] when it was set empty.
@@ -127,6 +162,10 @@ func (r Route) MarshalJSON() ([]byte, error) {
 		ID:          r.ID,
 		ModelMatch:  r.ModelMatch,
 		ProviderIDs: r.ProviderIDs,
+		Routing:     r.Routing,
+	}
+	if len(r.Weights) > 0 {
+		aux.Weights = r.Weights
 	}
 	if aux.ProviderIDs == nil {
 		aux.ProviderIDs = []string{}
@@ -153,12 +192,99 @@ func (r *Route) UnmarshalJSON(data []byte) error {
 	if r.ProviderIDs == nil {
 		r.ProviderIDs = []string{}
 	}
+	r.Routing = aux.Routing
+	r.Weights = aux.Weights
 	if aux.Eligible != nil {
 		r.EligibleSet = true
 		r.Eligible = *aux.Eligible
 	} else {
 		r.EligibleSet = false
 		r.Eligible = nil
+	}
+	return nil
+}
+
+// Group orders its members for one request name. A member is a
+// provider/model pair or another group. The group's id is the model name a
+// caller asks for. A group with no routing inherits a strategy from an outer
+// group when that strategy is inheritable; order and weight leave an inner
+// group on Smart.
+type Group struct {
+	ID          string         `json:"-"`
+	Members     []string       `json:"-"`
+	Routing     string         `json:"-"`
+	Weights     map[string]int `json:"-"`
+	Eligible    []ErrorClass   `json:"-"`
+	EligibleSet bool           `json:"-"`
+}
+
+// EligibleOrDefault returns the classes that may move from one member to the
+// next. The default matches Route: only an unavailable upstream falls through.
+func (g Group) EligibleOrDefault() []ErrorClass {
+	if !g.EligibleSet {
+		return []ErrorClass{ClassUpstreamUnavailable}
+	}
+	out := make([]ErrorClass, len(g.Eligible))
+	copy(out, g.Eligible)
+	return out
+}
+
+// Allows reports whether class may fall through to another member.
+func (g Group) Allows(class ErrorClass) bool {
+	for _, c := range g.EligibleOrDefault() {
+		if c == class {
+			return true
+		}
+	}
+	return false
+}
+
+type groupJSON struct {
+	ID       string         `json:"id"`
+	Members  []string       `json:"members"`
+	Routing  string         `json:"routing,omitempty"`
+	Weights  map[string]int `json:"weights,omitempty"`
+	Eligible *[]ErrorClass  `json:"eligible,omitempty"`
+}
+
+// MarshalJSON omits eligible when it was not set, and writes [] when it was set empty.
+func (g Group) MarshalJSON() ([]byte, error) {
+	aux := groupJSON{ID: g.ID, Members: g.Members, Routing: g.Routing}
+	if aux.Members == nil {
+		aux.Members = []string{}
+	}
+	if len(g.Weights) > 0 {
+		aux.Weights = g.Weights
+	}
+	if g.EligibleSet {
+		els := g.Eligible
+		if els == nil {
+			els = []ErrorClass{}
+		}
+		aux.Eligible = &els
+	}
+	return json.Marshal(aux)
+}
+
+// UnmarshalJSON records whether eligible was present.
+func (g *Group) UnmarshalJSON(data []byte) error {
+	var aux groupJSON
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	g.ID = aux.ID
+	g.Members = aux.Members
+	if g.Members == nil {
+		g.Members = []string{}
+	}
+	g.Routing = aux.Routing
+	g.Weights = aux.Weights
+	if aux.Eligible != nil {
+		g.EligibleSet = true
+		g.Eligible = *aux.Eligible
+	} else {
+		g.EligibleSet = false
+		g.Eligible = nil
 	}
 	return nil
 }
@@ -170,13 +296,72 @@ type Plugin struct {
 	Order   int    `json:"order"`
 }
 
+// PriceRule is a user price for a provider and model. Provider empty applies
+// to every provider. Model "*" applies to every model of that provider.
+// Each money field is US dollars per million tokens. An explicit zero is a
+// free token and wins over the catalog; a nil field falls back to the catalog.
+type PriceRule struct {
+	Provider     string   `json:"provider,omitempty"`
+	Model        string   `json:"model"`
+	Input        *float64 `json:"input,omitempty"`
+	Output       *float64 `json:"output,omitempty"`
+	CacheRead    *float64 `json:"cacheRead,omitempty"`
+	CacheWrite   *float64 `json:"cacheWrite,omitempty"`
+	CacheWrite1H *float64 `json:"cacheWrite1h,omitempty"`
+}
+
+// PeakWindow multiplies every price of the matching calls by Factor while the
+// local wall clock is inside [Start, End). Start and End are "HH:MM". An
+// empty or "*" model matches every model; an empty provider matches every
+// provider. A window that wraps past midnight is allowed.
+type PeakWindow struct {
+	Provider string  `json:"provider,omitempty"`
+	Model    string  `json:"model,omitempty"`
+	Start    string  `json:"start"`
+	End      string  `json:"end"`
+	Factor   float64 `json:"factor"`
+}
+
+// UsageHide hides rows from the usage page at or before Before for one
+// provider and model. The rows stay on disk and still count toward token
+// limits.
+type UsageHide struct {
+	ProviderID string    `json:"providerId"`
+	Model      string    `json:"model"`
+	Before     time.Time `json:"before"`
+}
+
+// TokenLimit is one cap on a gateway token. USD and Tokens may both be set;
+// nil or zero means that dimension is not capped. Window is today, week,
+// month, all, hours, or days. Provider and Model narrow the rows counted;
+// either may be empty. Hours and days use a rolling window ending now unless
+// Since is set, in which case the window starts at Since.
+type TokenLimit struct {
+	ID       string     `json:"id,omitempty"`
+	USD      *float64   `json:"usd,omitempty"`
+	Tokens   *int       `json:"tokens,omitempty"`
+	Window   string     `json:"window"`
+	Hours    int        `json:"hours,omitempty"`
+	Days     int        `json:"days,omitempty"`
+	Since    *time.Time `json:"since,omitempty"`
+	Provider string     `json:"provider,omitempty"`
+	Model    string     `json:"model,omitempty"`
+}
+
 // GatewayToken is a caller credential. Secret is stored in the file.
 // Models, when non-empty, is the only set of catalog ids this token may see or call.
+// SpendLimit and SpendPeriod are the older single-dollar cap. Limits holds up
+// to five caps with their own windows and scopes. IssuerID is set on a
+// short-lived token and names the token that issued it.
 type GatewayToken struct {
-	ID      string   `json:"id"`
-	Secret  string   `json:"secret"`
-	Revoked bool     `json:"revoked,omitempty"`
-	Models  []string `json:"models,omitempty"`
+	ID          string       `json:"id"`
+	Secret      string       `json:"secret"`
+	Revoked     bool         `json:"revoked,omitempty"`
+	Models      []string     `json:"models,omitempty"`
+	SpendLimit  *float64     `json:"spendLimit,omitempty"`
+	SpendPeriod string       `json:"spendPeriod,omitempty"`
+	Limits      []TokenLimit `json:"limits,omitempty"`
+	IssuerID    string       `json:"issuerId,omitempty"`
 }
 
 // Session is one console login. SecretHash is stored; the secret is not.
@@ -201,18 +386,28 @@ type Config struct {
 	Share         bool           `json:"share,omitempty"`
 	Providers     []Provider     `json:"providers"`
 	Routes        []Route        `json:"routes"`
+	Groups        []Group        `json:"groups,omitempty"`
 	Plugins       []Plugin       `json:"plugins"`
 	GatewayTokens []GatewayToken `json:"gatewayTokens"`
 	Users         []User         `json:"users"`
+	// Prices, Peaks, and UsageHidden are read when usage is priced or shown.
+	// They are never written into attempts.jsonl.
+	Prices      []PriceRule  `json:"prices,omitempty"`
+	Peaks       []PeakWindow `json:"peaks,omitempty"`
+	UsageHidden []UsageHide  `json:"usageHidden,omitempty"`
 	// NoAccountDiscovery, when true, stops the process from reading coding-agent
 	// sign-ins on this computer. Absent means those sign-ins are read.
 	NoAccountDiscovery bool `json:"noAccountDiscovery,omitempty"`
+	// NoAutoGroups, when true, stops a bare model name listed by more than one
+	// provider from becoming an implicit group. Absent means the group is made.
+	NoAutoGroups bool `json:"noAutoGroups,omitempty"`
 }
 
 func emptyConfig() Config {
 	return Config{
 		Providers:     []Provider{},
 		Routes:        []Route{},
+		Groups:        []Group{},
 		Plugins:       []Plugin{},
 		GatewayTokens: []GatewayToken{},
 		Users:         []User{},
@@ -225,6 +420,9 @@ func (c *Config) normalize() {
 	}
 	if c.Routes == nil {
 		c.Routes = []Route{}
+	}
+	if c.Groups == nil {
+		c.Groups = []Group{}
 	}
 	if c.Plugins == nil {
 		c.Plugins = []Plugin{}
@@ -245,6 +443,11 @@ func (c *Config) normalize() {
 			c.Routes[i].ProviderIDs = []string{}
 		}
 	}
+	for i := range c.Groups {
+		if c.Groups[i].Members == nil {
+			c.Groups[i].Members = []string{}
+		}
+	}
 	for i := range c.Users {
 		if c.Users[i].Sessions == nil {
 			c.Users[i].Sessions = []Session{}
@@ -262,24 +465,104 @@ func (c Config) clone() Config {
 		p.Models = append([]string(nil), p.Models...)
 		p.Credentials = append([]string(nil), p.Credentials...)
 		p.Info = cloneInfo(p.Info)
+		p.Multiplier = cloneFloat(p.Multiplier)
+		p.KeyMultipliers = append([]float64(nil), p.KeyMultipliers...)
 		out.Providers[i] = p
 	}
 	out.Routes = make([]Route, len(c.Routes))
 	for i, r := range c.Routes {
 		r.ProviderIDs = append([]string(nil), r.ProviderIDs...)
 		r.Eligible = append([]ErrorClass(nil), r.Eligible...)
+		if r.Weights != nil {
+			weights := make(map[string]int, len(r.Weights))
+			for id, weight := range r.Weights {
+				weights[id] = weight
+			}
+			r.Weights = weights
+		}
 		out.Routes[i] = r
+	}
+	out.Groups = make([]Group, len(c.Groups))
+	for i, g := range c.Groups {
+		g.Members = append([]string(nil), g.Members...)
+		g.Eligible = append([]ErrorClass(nil), g.Eligible...)
+		if g.Weights != nil {
+			weights := make(map[string]int, len(g.Weights))
+			for ref, weight := range g.Weights {
+				weights[ref] = weight
+			}
+			g.Weights = weights
+		}
+		out.Groups[i] = g
 	}
 	out.Plugins = append([]Plugin(nil), c.Plugins...)
 	out.GatewayTokens = make([]GatewayToken, len(c.GatewayTokens))
 	for i, t := range c.GatewayTokens {
 		t.Models = append([]string(nil), t.Models...)
+		t.Limits = cloneLimits(t.Limits)
 		out.GatewayTokens[i] = t
 	}
 	out.Users = make([]User, len(c.Users))
 	for i, u := range c.Users {
 		u.Sessions = append([]Session(nil), u.Sessions...)
 		out.Users[i] = u
+	}
+	out.Prices = clonePriceRules(c.Prices)
+	out.Peaks = append([]PeakWindow(nil), c.Peaks...)
+	out.UsageHidden = append([]UsageHide(nil), c.UsageHidden...)
+	return out
+}
+
+func cloneFloat(v *float64) *float64 {
+	if v == nil {
+		return nil
+	}
+	got := *v
+	return &got
+}
+
+func cloneInt(v *int) *int {
+	if v == nil {
+		return nil
+	}
+	got := *v
+	return &got
+}
+
+func cloneTime(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	got := *v
+	return &got
+}
+
+func cloneLimits(in []TokenLimit) []TokenLimit {
+	if in == nil {
+		return nil
+	}
+	out := make([]TokenLimit, len(in))
+	for i, limit := range in {
+		limit.USD = cloneFloat(limit.USD)
+		limit.Tokens = cloneInt(limit.Tokens)
+		limit.Since = cloneTime(limit.Since)
+		out[i] = limit
+	}
+	return out
+}
+
+func clonePriceRules(in []PriceRule) []PriceRule {
+	if in == nil {
+		return nil
+	}
+	out := make([]PriceRule, len(in))
+	for i, rule := range in {
+		rule.Input = cloneFloat(rule.Input)
+		rule.Output = cloneFloat(rule.Output)
+		rule.CacheRead = cloneFloat(rule.CacheRead)
+		rule.CacheWrite = cloneFloat(rule.CacheWrite)
+		rule.CacheWrite1H = cloneFloat(rule.CacheWrite1H)
+		out[i] = rule
 	}
 	return out
 }
@@ -314,6 +597,67 @@ func (c Config) RouteByModel(model string) (Route, bool) {
 	return Route{}, false
 }
 
+// GroupByID returns the group whose id equals id.
+func (c Config) GroupByID(id string) (Group, bool) {
+	for _, g := range c.Groups {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return Group{}, false
+}
+
+// GroupFor resolves a request name to a group. The bare id wins; group/<id>
+// is accepted as an unambiguous spelling for a group id that also looks like
+// a catalog id.
+func (c Config) GroupFor(model string) (Group, bool) {
+	if g, ok := c.GroupByID(model); ok {
+		return g, true
+	}
+	if id, ok := strings.CutPrefix(model, "group/"); ok {
+		return c.GroupByID(id)
+	}
+	return Group{}, false
+}
+
+// GroupMember is one resolved group member. Nested is true for a group id;
+// otherwise ProviderID and Model name one listed provider model.
+type GroupMember struct {
+	Ref        string
+	ProviderID string
+	Model      string
+	GroupID    string
+	Nested     bool
+}
+
+// ResolveGroupMember reads a member reference. A provider/model pair wins when
+// its provider exists; group/<id> names a nested group explicitly, and a bare
+// id names a nested group when no provider has that id.
+func (c Config) ResolveGroupMember(ref string) (GroupMember, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return GroupMember{}, false
+	}
+	if id, ok := strings.CutPrefix(ref, "group/"); ok {
+		if _, found := c.GroupByID(id); !found {
+			return GroupMember{}, false
+		}
+		return GroupMember{Ref: ref, GroupID: id, Nested: true}, true
+	}
+	if providerID, model, ok := strings.Cut(ref, "/"); ok && providerID != "" && model != "" {
+		if provider, found := c.Provider(providerID); found {
+			if !provider.ChatModel(model) {
+				return GroupMember{}, false
+			}
+			return GroupMember{Ref: ref, ProviderID: providerID, Model: model}, true
+		}
+	}
+	if _, found := c.GroupByID(ref); found {
+		return GroupMember{Ref: ref, GroupID: ref, Nested: true}, true
+	}
+	return GroupMember{}, false
+}
+
 // IDs returns the ids of one object type.
 func ProviderIDs(c Config) []string {
 	out := make([]string, len(c.Providers))
@@ -328,6 +672,15 @@ func RouteIDs(c Config) []string {
 	out := make([]string, len(c.Routes))
 	for i, r := range c.Routes {
 		out[i] = r.ID
+	}
+	return out
+}
+
+// GroupIDs returns group ids.
+func GroupIDs(c Config) []string {
+	out := make([]string, len(c.Groups))
+	for i, g := range c.Groups {
+		out[i] = g.ID
 	}
 	return out
 }
