@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuangjm123/AIGate/internal/agent"
 	"github.com/kuangjm123/AIGate/internal/console"
 	"github.com/kuangjm123/AIGate/internal/gateway"
 	"github.com/kuangjm123/AIGate/internal/login"
@@ -35,6 +36,7 @@ type App struct {
 	console *console.Server
 	log     *log.Logger
 	bindMu  sync.RWMutex
+	agents  *agent.Machine
 	gw      port
 	cs      port
 }
@@ -99,8 +101,9 @@ func (a *App) Start() error {
 	return nil
 }
 
-// Shutdown stops both listeners.
+// Shutdown restores a Codex connected by this process, then stops both listeners.
 func (a *App) Shutdown(ctx context.Context) error {
+	a.restoreCodex()
 	a.bindMu.Lock()
 	defer a.bindMu.Unlock()
 	var err error
@@ -115,6 +118,18 @@ func (a *App) Shutdown(ctx context.Context) error {
 	a.gw = port{}
 	a.cs = port{}
 	return err
+}
+
+func (a *App) restoreCodex() {
+	if a.agents == nil {
+		return
+	}
+	err := agent.Disconnect(*a.agents, "codex")
+	switch agent.CodeOf(err) {
+	case "", "not_connected", "absent":
+		return
+	}
+	a.log.Printf("codex config restore incomplete")
 }
 
 // Update publishes a new config, then rebinds listeners when their addresses changed.
@@ -277,6 +292,13 @@ func (a *App) closeAll() {
 func (a *App) EnableAccounts() {
 	a.gateway.Login = a.loginMachine
 	a.console.Logins = a.loginMachine
+}
+
+// EnableAgentWiring makes the Agent page read m and makes Shutdown put back
+// Codex's recorded config before the listeners close.
+func (a *App) EnableAgentWiring(machine agent.Machine) {
+	a.agents = &machine
+	a.console.Agents = &machine
 }
 
 func (a *App) loginMachine() login.Machine {
