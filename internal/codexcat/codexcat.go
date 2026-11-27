@@ -21,11 +21,13 @@ const AppList = 100
 // Vision nil means its image support is unknown; only an explicit true offers
 // images to Codex.
 type Model struct {
-	ID        string
-	Name      string
-	Context   int
-	Reasoning bool
-	Vision    *bool
+	ID                    string
+	Name                  string
+	Context               int
+	Reasoning             bool
+	ReasoningEfforts      []string
+	ReasoningEffortsKnown bool
+	Vision                *bool
 }
 
 type reasoningLevel struct {
@@ -227,7 +229,7 @@ func entriesFor(models []Model, effort string) []entry {
 		if name == "" {
 			name = id
 		}
-		levels, def := reasoning(model.Reasoning, effort)
+		levels, def := reasoning(model, effort)
 		e := entry{
 			Slug:                id,
 			DisplayName:         name,
@@ -265,24 +267,66 @@ func entriesFor(models []Model, effort string) []entry {
 	return out
 }
 
-func reasoning(on bool, chosen string) ([]reasoningLevel, *string) {
-	if !on {
+func reasoning(model Model, chosen string) ([]reasoningLevel, *string) {
+	if !model.Reasoning && len(model.ReasoningEfforts) == 0 {
 		return []reasoningLevel{}, nil
 	}
-	names := []string{"low", "medium", "high", "xhigh"}
+	names := cleanLevels(model.ReasoningEfforts)
+	levelsKnown := model.ReasoningEffortsKnown || model.ReasoningEfforts != nil
+	if len(names) == 0 && !levelsKnown {
+		names = []string{"low", "medium", "high", "xhigh"}
+	}
+	if model.Reasoning && len(names) > 0 && !contains(names, "ultra") && addUltra(model.ID) {
+		names = append(names, "ultra")
+	}
 	chosen = strings.ToLower(strings.TrimSpace(chosen))
-	if chosen != "" && !contains(names, chosen) {
+	if chosen == "ultra" && !contains(names, "ultra") && !addUltra(model.ID) {
+		chosen = "max"
+	}
+	if chosen != "" && (len(names) > 0 || !levelsKnown) && !contains(names, chosen) {
 		names = append(names, chosen)
 	}
 	levels := make([]reasoningLevel, 0, len(names))
 	for _, name := range names {
 		levels = append(levels, reasoningLevel{Effort: name, Description: effortLabel(name)})
 	}
-	def := "medium"
+	def := ""
+	if contains(names, "medium") {
+		def = "medium"
+	} else if len(names) > 0 {
+		def = names[0]
+	}
 	if chosen != "" {
 		def = chosen
 	}
+	if def == "" {
+		return levels, nil
+	}
 	return levels, &def
+}
+
+func cleanLevels(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, level := range in {
+		level = strings.ToLower(strings.TrimSpace(level))
+		if level != "" && !contains(out, level) {
+			out = append(out, level)
+		}
+	}
+	return out
+}
+
+// addUltra is the selector half of ultra: non-OpenAI reasoning models may
+// offer it, and the gateway turns it into max (or the nearest lower level)
+// before the request leaves. OpenAI's own catalog only lists it explicitly.
+func addUltra(id string) bool {
+	name := strings.ToLower(strings.TrimSpace(id))
+	for _, prefix := range []string{"gpt-", "o1", "o3", "o4", "codex", "chatgpt"} {
+		if strings.HasPrefix(name, prefix) || strings.Contains(name, "/"+prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 func effortLabel(effort string) string {

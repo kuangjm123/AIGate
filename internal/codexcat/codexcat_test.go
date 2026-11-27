@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,54 @@ func TestCatalogUsesCodexModelShape(t *testing.T) {
 	if second["supported_reasoning_levels"] == nil || len(second["supported_reasoning_levels"].([]any)) != 0 {
 		t.Fatalf("non-reasoning levels %#v", second["supported_reasoning_levels"])
 	}
+}
+
+func TestCatalogUsesKnownLevelsAndUltra(t *testing.T) {
+	models, _ := decode(t, Catalog([]Model{
+		{
+			ID: "p/reasoner", Reasoning: true,
+			ReasoningEfforts: []string{"low", "high", "max"}, ReasoningEffortsKnown: true,
+		},
+		{
+			ID: "gpt-5", Reasoning: true,
+			ReasoningEfforts: []string{"low", "high", "max", "ultra"}, ReasoningEffortsKnown: true,
+		},
+		{
+			ID: "p/no-selector", Reasoning: true,
+			ReasoningEfforts: []string{}, ReasoningEffortsKnown: true,
+		},
+	}, "ultra", nil))
+	first := models[0]
+	if first["default_reasoning_level"] != "ultra" {
+		t.Fatalf("reasoner default %#v", first)
+	}
+	if got := effortNames(first); strings.Join(got, ",") != "low,high,max,ultra" {
+		t.Fatalf("reasoner levels %v", got)
+	}
+	second := models[1]
+	if second["default_reasoning_level"] != "ultra" {
+		t.Fatalf("OpenAI default %#v", second)
+	}
+	if got := effortNames(second); strings.Join(got, ",") != "low,high,max,ultra" {
+		t.Fatalf("OpenAI levels %v", got)
+	}
+	third := models[2]
+	if third["default_reasoning_level"] != nil || len(effortNames(third)) != 0 {
+		t.Fatalf("known empty levels %#v", third)
+	}
+}
+
+func effortNames(entry map[string]any) []string {
+	rows, _ := entry["supported_reasoning_levels"].([]any)
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		item, _ := row.(map[string]any)
+		name, _ := item["effort"].(string)
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func TestKeepCarriesUserKeysAndTrueOverrides(t *testing.T) {

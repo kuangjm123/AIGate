@@ -6,6 +6,7 @@ These pages record decisions this repository has not implemented. A [subsystem r
 | --- | --- |
 | [Ports](ports.md) | Nothing of the port split is still open |
 | [Gateway](gateway.md) | How a plugin is loaded |
+| [Reasoning effort](reasoning-effort.md) | Nothing of the level mapping is still open |
 | [State](state.md) | Encryption of the config file at rest |
 | [Security](security.md) | Nothing of the non-loopback gateway confirmation is still open |
 | [Usage ledger](usage-ledger.md) | Disk block cache, provider rename mapping, cache-hit/decode summaries, and OTLP export |

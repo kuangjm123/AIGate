@@ -298,6 +298,35 @@ func TestCodexCatalogAndProviderSettings(t *testing.T) {
 	}
 }
 
+func TestCodexCatalogCarriesProviderLevels(t *testing.T) {
+	m := testMachine(t)
+	path := codexPath(m)
+	writeFile(t, path, "model = \"old\"\nmodel_reasoning_effort = \"high\"\n")
+	models := []Model{{
+		ID: "p1/reasoner", Name: "Reasoner", Reasoning: true,
+		ReasoningEfforts: []string{"low", "high"}, ReasoningEffortsKnown: true,
+	}}
+	if err := Connect(m, "codex", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	catalog := readDoc(t, codexCatalogPath(m))
+	list, _ := catalog["models"].([]any)
+	entry, _ := list[0].(map[string]any)
+	if entry["default_reasoning_level"] != "high" {
+		t.Fatalf("default level %#v", entry)
+	}
+	levels, _ := entry["supported_reasoning_levels"].([]any)
+	if len(levels) != 3 {
+		t.Fatalf("levels %#v", levels)
+	}
+	for i, want := range []string{"low", "high", "ultra"} {
+		row, _ := levels[i].(map[string]any)
+		if row["effort"] != want {
+			t.Fatalf("levels %#v", levels)
+		}
+	}
+}
+
 func TestCodexKeepsUserBaseURLTokenAndHeaders(t *testing.T) {
 	m := testMachine(t)
 	path := codexPath(m)

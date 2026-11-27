@@ -186,6 +186,14 @@ func TestWorkBuddyDesktopLoginIsReadOnly(t *testing.T) {
 	if account.Origin != "desktop" || !account.ModelsKnown || !hasModel(account, "glm-5.3") || hasModel(account, "deepseek-v4-pro") || hasModel(account, "hunyuan-2.0-instruct") {
 		t.Fatalf("account %#v", got.Accounts)
 	}
+	for _, model := range account.Models {
+		if model.ID != "glm-5.3" {
+			continue
+		}
+		if !model.Reasoning || !model.ReasoningEffortsKnown || len(model.ReasoningEfforts) != 1 || model.ReasoningEfforts[0] != "high" {
+			t.Fatalf("glm levels %#v", model)
+		}
+	}
 	blob, _ := json.Marshal(got)
 	if strings.Contains(string(blob), access) || strings.Contains(string(blob), refresh) || strings.Contains(string(blob), "plan-secret") {
 		t.Fatal("discovery returned a token")

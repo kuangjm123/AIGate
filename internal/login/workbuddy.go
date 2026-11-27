@@ -357,9 +357,10 @@ func parseWorkBuddyConfig(raw []byte) ([]Model, bool) {
 	}
 	detail := map[string]Model{}
 	for _, model := range doc.Models {
+		reasoning, levels, known := reasoningInfo(model.ReasoningEffort)
 		detail[model.ID] = Model{
 			ID: model.ID, Name: model.Name, Context: model.MaxInputTokens,
-			Reasoning: reasoningSet(model.ReasoningEffort),
+			Reasoning: reasoning, ReasoningEfforts: levels, ReasoningEffortsKnown: known,
 		}
 	}
 	out := make([]Model, 0, len(ids))
@@ -397,20 +398,39 @@ func cliModelIDs(raw json.RawMessage) []string {
 	return ids
 }
 
-func reasoningSet(raw json.RawMessage) bool {
+func reasoningInfo(raw json.RawMessage) (bool, []string, bool) {
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
-		return false
+		return false, nil, false
 	}
 	var list []string
 	if json.Unmarshal(raw, &list) == nil {
-		return len(list) > 0
+		return len(list) > 0, cleanLevels(list), true
 	}
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return strings.TrimSpace(text) != ""
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return false, []string{}, true
+		}
+		return true, []string{text}, true
 	}
-	return true
+	var enabled bool
+	if json.Unmarshal(raw, &enabled) == nil {
+		return enabled, nil, false
+	}
+	return true, nil, false
+}
+
+func cleanLevels(levels []string) []string {
+	out := make([]string, 0, len(levels))
+	for _, level := range levels {
+		level = strings.ToLower(strings.TrimSpace(level))
+		if level != "" {
+			out = append(out, level)
+		}
+	}
+	return out
 }
 
 func workBuddyOrigin(m Machine, cred wbCred) string {

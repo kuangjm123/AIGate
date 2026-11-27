@@ -21,12 +21,14 @@ import (
 // ID is the catalog id a JSON body should send. Bare has no slash, for a path that
 // cannot carry one.
 type Model struct {
-	ID        string
-	Name      string
-	Bare      string
-	Context   int
-	Reasoning bool
-	Vision    *bool
+	ID                    string
+	Name                  string
+	Bare                  string
+	Context               int
+	Reasoning             bool
+	ReasoningEfforts      []string
+	ReasoningEffortsKnown bool
+	Vision                *bool
 }
 
 // Target is the gateway the agent should call. Origin has no path.
@@ -225,7 +227,7 @@ func Offers(cfg state.Config) []Model {
 	routed := map[string]bool{}
 	seen := map[string]bool{}
 	var out []Model
-	add := func(id, name, bare string, context int, reasoning bool, vision *bool) {
+	add := func(id, name, bare string, context int, reasoning bool, efforts []string, effortsKnown bool, vision *bool) {
 		id = strings.TrimSpace(id)
 		if id == "" || seen[id] {
 			return
@@ -237,20 +239,24 @@ func Offers(cfg state.Config) []Model {
 		if bare == "" {
 			bare = id
 		}
-		out = append(out, Model{ID: id, Name: name, Bare: bare, Context: context, Reasoning: reasoning, Vision: vision})
+		out = append(out, Model{
+			ID: id, Name: name, Bare: bare, Context: context, Reasoning: reasoning,
+			ReasoningEfforts: append([]string(nil), efforts...), ReasoningEffortsKnown: effortsKnown,
+			Vision: vision,
+		})
 	}
 	for _, route := range cfg.Routes {
 		if route.ModelMatch == "" {
 			continue
 		}
 		routed[route.ModelMatch] = true
-		add(route.ModelMatch, route.ModelMatch, route.ModelMatch, 0, false, nil)
+		add(route.ModelMatch, route.ModelMatch, route.ModelMatch, 0, false, nil, false, nil)
 	}
 	for _, group := range cfg.Groups {
 		if group.ID == "" {
 			continue
 		}
-		add("group/"+group.ID, group.ID, group.ID, 0, false, nil)
+		add("group/"+group.ID, group.ID, group.ID, 0, len(group.Levels) > 0, group.Levels, len(group.Levels) > 0, nil)
 	}
 	for _, p := range cfg.Providers {
 		owner := p.ID
@@ -264,6 +270,8 @@ func Offers(cfg state.Config) []Model {
 			name := model
 			var context int
 			var reasoning bool
+			var efforts []string
+			var effortsKnown bool
 			var vision *bool
 			if info, ok := p.InfoFor(model); ok {
 				if info.DisplayName != "" {
@@ -271,12 +279,13 @@ func Offers(cfg state.Config) []Model {
 				}
 				context = info.Context
 				reasoning = info.Reasoning
+				efforts, effortsKnown = info.ReasoningLevels()
 				if info.Vision != nil {
 					v := *info.Vision
 					vision = &v
 				}
 			}
-			add(owner+"/"+model, name, model, context, reasoning, vision)
+			add(owner+"/"+model, name, model, context, reasoning, efforts, effortsKnown, vision)
 		}
 	}
 	return out

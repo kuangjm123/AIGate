@@ -28,6 +28,17 @@ type seatCandidate struct {
 	TopMember string
 	// Scopes are the group nodes above this seat, outermost first.
 	Scopes []*planScope
+	// Reasoning levels of a subscription model. Known false means the catalog
+	// did not say; a known empty list is a model with no selector.
+	ReasoningLevels      []string
+	ReasoningLevelsKnown bool
+	Levelless            bool
+	ReasoningFixed       string
+	ReasoningAllowed     []string
+	ReasoningMap         map[string]string
+	// ReasoningMember is the member reference the map was read from. A nested
+	// group can replace TopMember with an outer reference after the map is set.
+	ReasoningMember string
 }
 
 func providerSeatKey(providerID, key string) string {
@@ -114,7 +125,7 @@ func loginSeatCandidates(snap login.Snapshot, model string, explicitAccount stri
 		} else if account.ID != explicitAccount {
 			continue
 		}
-		out = append(out, loginSeatCandidate(account.ID, model))
+		out = append(out, loginSeatFor(account, model))
 	}
 	return out
 }
@@ -129,6 +140,20 @@ func loginSeatCandidate(account, model string) seatCandidate {
 		Login:      true,
 		TopMember:  "login/" + account,
 	}
+}
+
+func loginSeatFor(account login.Account, model string) seatCandidate {
+	seat := loginSeatCandidate(account.ID, model)
+	for _, item := range account.Models {
+		if item.ID != model {
+			continue
+		}
+		seat.ReasoningLevels = append([]string(nil), item.ReasoningEfforts...)
+		seat.ReasoningLevelsKnown = item.ReasoningEffortsKnown || item.ReasoningEfforts != nil
+		seat.Levelless = seat.ReasoningLevelsKnown && len(item.ReasoningEfforts) == 0
+		break
+	}
+	return seat
 }
 
 func findLoginAccount(snap login.Snapshot, id string) (login.Account, bool) {

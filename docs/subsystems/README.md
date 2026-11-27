@@ -9,6 +9,7 @@ The [README](../../README.md) states the product. It does not name subsystems, a
 | [Ports](ports.md) | One process, two listeners, and how a config write reaches the gateway |
 | [State](state.md) | Config file, usage store, snapshot, and a failed read |
 | [Gateway](gateway.md) | Token check, the attempt loop, and the closed no-dialect path |
+| [Reasoning](reasoning.md) | Level metadata, per-attempt vendor rewriting, Gemini retry, and the Codex selector |
 | [Console](console.md) | The control page and the JSON API on the console port |
 | [Usage](../usage.md) | The ledger, read-time pricing, gateway-token caps, usage page reads, and reported calls |
 | [Security](security.md) | Bind addresses, secret masking, and provider base URLs |

@@ -10,6 +10,8 @@ An enabled plugin whose id is `claude`, `codex`, `copilot`, `gemini`, `antigravi
 
 The list is not the one written when an agent is connected.
 
+Codex's model list also carries each model's `supported_reasoning_levels`, and WorkBuddy's carries its `reasoningEffort` list. Those become the model's reasoning levels for the [reasoning mapping](reasoning.md). A sign-in whose model format has no level list leaves the levels unknown rather than empty.
+
 Claude Code uses the public model ids in [login.claudePublic](../../internal/login/claude.go), plus `availableModels`, `modelPicker.options`, and `modelOverrides` in `~/.claude/settings.json`. The sign-in is not sent to Anthropic to ask for models.
 
 Codex with `auth_mode` `chatgpt` sends the ChatGPT access token to `https://chatgpt.com/backend-api/codex/models`. A model the backend does not list is not offered. A failed read leaves the model list unknown. Codex with `auth_mode` `apikey` uses `OPENAI_API_KEY` from the same `auth.json` and reads `https://api.openai.com/v1/models`. The key is not copied into config.

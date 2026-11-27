@@ -43,7 +43,12 @@ type ModelInfo struct {
 	Hidden      bool   `json:"hidden,omitempty"`
 	Context     int    `json:"context,omitempty"`
 	Reasoning   bool   `json:"reasoning,omitempty"`
-	Vision      *bool  `json:"vision,omitempty"`
+	// ReasoningEfforts is the model's own level names. ReasoningEffortsKnown
+	// separates an empty known list (the model has no level selector) from a
+	// list the process has not read yet.
+	ReasoningEfforts      []string `json:"-"`
+	ReasoningEffortsKnown bool     `json:"-"`
+	Vision                *bool    `json:"vision,omitempty"`
 }
 
 // Provider is a configured upstream. Protocol is stored and not interpreted.
@@ -216,6 +221,10 @@ type Group struct {
 	Weights     map[string]int `json:"-"`
 	Eligible    []ErrorClass   `json:"-"`
 	EligibleSet bool           `json:"-"`
+	// Levels replaces every member model's level list for this group.
+	// ReasoningMap rewrites a client level to the level a member sends.
+	Levels       []string          `json:"-"`
+	ReasoningMap map[string]string `json:"-"`
 }
 
 // EligibleOrDefault returns the classes that may move from one member to the
@@ -240,11 +249,13 @@ func (g Group) Allows(class ErrorClass) bool {
 }
 
 type groupJSON struct {
-	ID       string         `json:"id"`
-	Members  []string       `json:"members"`
-	Routing  string         `json:"routing,omitempty"`
-	Weights  map[string]int `json:"weights,omitempty"`
-	Eligible *[]ErrorClass  `json:"eligible,omitempty"`
+	ID           string            `json:"id"`
+	Members      []string          `json:"members"`
+	Routing      string            `json:"routing,omitempty"`
+	Weights      map[string]int    `json:"weights,omitempty"`
+	Eligible     *[]ErrorClass     `json:"eligible,omitempty"`
+	Levels       []string          `json:"levels,omitempty"`
+	ReasoningMap map[string]string `json:"reasoningMap,omitempty"`
 }
 
 // MarshalJSON omits eligible when it was not set, and writes [] when it was set empty.
@@ -255,6 +266,12 @@ func (g Group) MarshalJSON() ([]byte, error) {
 	}
 	if len(g.Weights) > 0 {
 		aux.Weights = g.Weights
+	}
+	if len(g.Levels) > 0 {
+		aux.Levels = g.Levels
+	}
+	if len(g.ReasoningMap) > 0 {
+		aux.ReasoningMap = g.ReasoningMap
 	}
 	if g.EligibleSet {
 		els := g.Eligible
@@ -279,6 +296,19 @@ func (g *Group) UnmarshalJSON(data []byte) error {
 	}
 	g.Routing = aux.Routing
 	g.Weights = aux.Weights
+	g.Levels = append([]string(nil), aux.Levels...)
+	g.ReasoningMap = cloneStringMap(aux.ReasoningMap)
+	if len(g.Levels) == 0 && len(g.ReasoningMap) == 0 {
+		var raw map[string]json.RawMessage
+		if json.Unmarshal(data, &raw) == nil {
+			if value, ok := raw["reasoningLevels"]; ok {
+				_ = json.Unmarshal(value, &g.Levels)
+			}
+			if value, ok := raw["reasoningMap"]; ok {
+				_ = json.Unmarshal(value, &g.ReasoningMap)
+			}
+		}
+	}
 	if aux.Eligible != nil {
 		g.EligibleSet = true
 		g.Eligible = *aux.Eligible
@@ -486,6 +516,7 @@ func (c Config) clone() Config {
 	for i, g := range c.Groups {
 		g.Members = append([]string(nil), g.Members...)
 		g.Eligible = append([]ErrorClass(nil), g.Eligible...)
+		g.Levels = append([]string(nil), g.Levels...)
 		if g.Weights != nil {
 			weights := make(map[string]int, len(g.Weights))
 			for ref, weight := range g.Weights {
@@ -493,6 +524,7 @@ func (c Config) clone() Config {
 			}
 			g.Weights = weights
 		}
+		g.ReasoningMap = cloneStringMap(g.ReasoningMap)
 		out.Groups[i] = g
 	}
 	out.Plugins = append([]Plugin(nil), c.Plugins...)
@@ -519,6 +551,17 @@ func cloneFloat(v *float64) *float64 {
 	}
 	got := *v
 	return &got
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func cloneInt(v *int) *int {
@@ -628,6 +671,8 @@ type GroupMember struct {
 	Model      string
 	GroupID    string
 	Nested     bool
+	Fixed      string
+	Allowed    []string
 }
 
 // ResolveGroupMember reads a member reference. A provider/model pair wins when
@@ -638,24 +683,69 @@ func (c Config) ResolveGroupMember(ref string) (GroupMember, bool) {
 	if ref == "" {
 		return GroupMember{}, false
 	}
+	original := ref
+	base, fixed, allowed, hasLevels := splitMemberLevels(ref)
+	if hasLevels {
+		ref = base
+	}
 	if id, ok := strings.CutPrefix(ref, "group/"); ok {
 		if _, found := c.GroupByID(id); !found {
 			return GroupMember{}, false
 		}
-		return GroupMember{Ref: ref, GroupID: id, Nested: true}, true
+		return GroupMember{Ref: original, GroupID: id, Nested: true, Fixed: fixed, Allowed: allowed}, true
 	}
 	if providerID, model, ok := strings.Cut(ref, "/"); ok && providerID != "" && model != "" {
 		if provider, found := c.Provider(providerID); found {
 			if !provider.ChatModel(model) {
 				return GroupMember{}, false
 			}
-			return GroupMember{Ref: ref, ProviderID: providerID, Model: model}, true
+			return GroupMember{Ref: original, ProviderID: providerID, Model: model, Fixed: fixed, Allowed: allowed}, true
 		}
 	}
 	if _, found := c.GroupByID(ref); found {
-		return GroupMember{Ref: ref, GroupID: ref, Nested: true}, true
+		return GroupMember{Ref: original, GroupID: ref, Nested: true, Fixed: fixed, Allowed: allowed}, true
 	}
 	return GroupMember{}, false
+}
+
+func splitMemberLevels(ref string) (string, string, []string, bool) {
+	at := strings.LastIndex(ref, ":")
+	if at <= 0 || at == len(ref)-1 {
+		return ref, "", nil, false
+	}
+	suffix := ref[at+1:]
+	parts := strings.Split(suffix, "+")
+	levels := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part == "off" {
+			part = "none"
+		}
+		switch part {
+		case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "light", "extra_high":
+		default:
+			return ref, "", nil, false
+		}
+		if !containsString(levels, part) {
+			levels = append(levels, part)
+		}
+	}
+	if len(levels) == 0 {
+		return ref, "", nil, false
+	}
+	if len(levels) == 1 {
+		return ref[:at], levels[0], nil, true
+	}
+	return ref[:at], "", levels, true
+}
+
+func containsString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // IDs returns the ids of one object type.

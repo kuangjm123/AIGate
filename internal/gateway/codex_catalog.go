@@ -34,7 +34,8 @@ func (s *Server) writeCodexCatalog(w http.ResponseWriter, cfg state.Config, admi
 		}
 		models = append(models, codexcat.Model{
 			ID: id, Name: entry.Name, Context: entry.Context,
-			Reasoning: entry.Reasoning, Vision: entry.Vision,
+			Reasoning: entry.Reasoning, ReasoningEfforts: entry.ReasoningEfforts,
+			ReasoningEffortsKnown: entry.ReasoningEffortsKnown, Vision: entry.Vision,
 		})
 	}
 	body := codexcat.Catalog(models, "", s.codexUsed(admitted))

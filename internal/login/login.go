@@ -13,10 +13,12 @@ import (
 
 // Model is one model a sign-in can serve. ID is the upstream model id.
 type Model struct {
-	ID        string
-	Name      string
-	Context   int
-	Reasoning bool
+	ID                    string
+	Name                  string
+	Context               int
+	Reasoning             bool
+	ReasoningEfforts      []string
+	ReasoningEffortsKnown bool
 }
 
 // Account is one local sign-in shown as a provider.

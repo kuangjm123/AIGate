@@ -8,6 +8,9 @@ func cloneInfo(in []ModelInfo) []ModelInfo {
 	}
 	out := make([]ModelInfo, len(in))
 	for i, info := range in {
+		if info.ReasoningEfforts != nil {
+			info.ReasoningEfforts = append([]string{}, info.ReasoningEfforts...)
+		}
 		if info.Vision != nil {
 			v := *info.Vision
 			info.Vision = &v

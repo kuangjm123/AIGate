@@ -131,6 +131,8 @@ func (s *Server) offerModels(cfg state.Config) []agent.Model {
 			models = append(models, agent.Model{
 				ID: login.CatalogID(account.ID, model.ID), Name: name, Bare: model.ID,
 				Context: model.Context, Reasoning: model.Reasoning,
+				ReasoningEfforts:      append([]string(nil), model.ReasoningEfforts...),
+				ReasoningEffortsKnown: model.ReasoningEffortsKnown,
 			})
 		}
 	}

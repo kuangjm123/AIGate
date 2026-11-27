@@ -33,6 +33,8 @@ func (s *Server) loginEntries(kind string) []catalogEntry {
 			out = append(out, catalogEntry{
 				ID: login.CatalogID(account.ID, model.ID), Name: model.Name, Owner: "login/" + account.ID, Bare: model.ID,
 				Context: model.Context, Reasoning: model.Reasoning,
+				ReasoningEfforts:      append([]string(nil), model.ReasoningEfforts...),
+				ReasoningEffortsKnown: model.ReasoningEffortsKnown,
 			})
 		}
 	}
@@ -117,7 +119,7 @@ func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, snap *state.
 	if account == "claude" {
 		asked.Stream = false
 	}
-	reply := s.writeReply(w, r, up, proto, dest, asked, call, told, ancillary)
+	reply := s.writeReply(w, r, up, proto, dest, asked, call, told, ancillary, false)
 	status, usage, output, complete := reply.status, reply.usage, reply.output, reply.complete
 	outcome := OutcomeSuccess
 	if status < 200 || status >= 300 {

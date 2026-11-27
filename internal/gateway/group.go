@@ -97,6 +97,12 @@ func (s *Server) planGroupWithExtra(ctx context.Context, cfg state.Config, asked
 			continue
 		}
 		for i := range seats {
+			if member.Fixed != "" {
+				seats[i].ReasoningFixed = member.Fixed
+			}
+			if len(member.Allowed) > 0 {
+				seats[i].ReasoningAllowed = append([]string(nil), member.Allowed...)
+			}
 			seats[i].TopMember = member.Ref
 			seats[i].Weight = 0
 		}
@@ -155,6 +161,13 @@ func (s *Server) planGroupWithExtra(ctx context.Context, cfg state.Config, asked
 		}
 		for i := range member.seats {
 			seat := member.seats[i]
+			if len(g.Levels) > 0 && len(seat.ReasoningAllowed) == 0 {
+				seat.ReasoningAllowed = append([]string(nil), g.Levels...)
+			}
+			if len(g.ReasoningMap) > 0 && seat.ReasoningMap == nil {
+				seat.ReasoningMap = g.ReasoningMap
+				seat.ReasoningMember = seat.TopMember
+			}
 			seat.Scopes = append([]*planScope{scope}, seat.Scopes...)
 			out.seats = append(out.seats, seat)
 		}

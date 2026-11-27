@@ -8,12 +8,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/kuangjm123/aiconv"
 
 	"github.com/kuangjm123/AIGate/internal/login"
+	"github.com/kuangjm123/AIGate/internal/reasoning"
 	"github.com/kuangjm123/AIGate/internal/security"
 	"github.com/kuangjm123/AIGate/internal/state"
 )
@@ -159,6 +161,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		call.Stream = parsed.Stream
 	}
 	meta.Model = parsed.Model
+	thinking := reasoning.Read(string(parsed.Protocol), accepted)
 	if r.Context().Err() != nil {
 		return cancelBeforeRoute()
 	}
@@ -222,7 +225,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 		if !state.AllowsModel(admitted.allow, parsed.Model, loginModel) {
 			return rejectLogin(CodeModelDenied, CodeModelDenied, http.StatusForbidden)
 		}
-		seats = []seatCandidate{loginSeatCandidate(loginAccount, loginModel)}
+		seats = []seatCandidate{loginSeatFor(account, loginModel)}
 	} else if group, found := snap.Config.GroupFor(parsed.Model); found {
 		plannedGroup = s.planGroup(r.Context(), snap.Config, parsed.Model, group, "", nil)
 		route = plannedGroup.route
@@ -455,33 +458,70 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 				last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: upModel, outcome: "unsupported", status: http.StatusBadGateway, started: started, errText: "unsupported", rejected: true}
 				return 0, false
 			}
+			baseOutbound := append([]byte(nil), outbound...)
+			target := reasoningTargetFor(snap.Config, seat, dest, upModel)
+			outbound, levelResult := reasoning.Rewrite(outbound, thinking, target)
+			upstreamStream := parsed.Stream
+			aggregateChat := false
+			if dest == ProtoChat && !seat.Login && !parsed.Stream &&
+				dashScopeBase(prov.BaseURL) && (thinkingRequested(thinking) || levelSent(levelResult)) {
+				upstreamStream = true
+				aggregateChat = true
+			}
 			if !ancillary && !seat.Login {
 				outbound = s.rewriteTry(r.Context(), outbound, call, prov.ID, dest)
 			}
+			if aggregateChat {
+				outbound = withStream(outbound, true)
+			}
 			sent := outboundModel(dest, outbound, upModel)
-			up, err := s.postSeat(r.Context(), seat, dest, upModel, parsed.Stream, outbound)
-			if err != nil && r.Context().Err() != nil {
-				return writeCanceled(attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, providerKeyID: providerKeyID, started: started}), true
-			}
-			if err != nil {
-				if errors.Is(err, login.ErrPlugin) {
-					last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: "plugin", status: http.StatusBadGateway, started: started, errText: "plugin", rejected: true}
-					return finishFailure(last, "plugin"), true
+			var up *http.Response
+			retriedLevel := false
+			for {
+				up, err = s.postSeat(r.Context(), seat, dest, upModel, upstreamStream, outbound)
+				if err != nil && r.Context().Err() != nil {
+					return writeCanceled(attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, providerKeyID: providerKeyID, started: started}), true
 				}
-				class := string(state.ClassUpstreamUnavailable)
-				last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: class, started: started, providerKeyID: providerKeyID, errText: class, bytesIn: int64(len(outbound))}
-				s.markFailure(pool, seat.Key, class)
-				if !s.fallThrough(route, seats, chosen, class) {
-					return finishFailure(last, class), true
+				if err != nil {
+					if errors.Is(err, login.ErrPlugin) {
+						last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: "plugin", status: http.StatusBadGateway, started: started, errText: "plugin", rejected: true}
+						return finishFailure(last, "plugin"), true
+					}
+					class := string(state.ClassUpstreamUnavailable)
+					last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: class, started: started, providerKeyID: providerKeyID, errText: class, bytesIn: int64(len(outbound))}
+					s.markFailure(pool, seat.Key, class)
+					if !s.fallThrough(route, seats, chosen, class) {
+						return finishFailure(last, class), true
+					}
+					lastEnd = time.Now().UTC()
+					return 0, false
 				}
-				lastEnd = time.Now().UTC()
-				return 0, false
-			}
-			outcome := classifyStatus(up.StatusCode)
-			if outcome != "" || up.StatusCode < 200 || up.StatusCode >= 300 {
+				outcome := classifyStatus(up.StatusCode)
+				if outcome == "" && up.StatusCode >= 200 && up.StatusCode < 300 {
+					break
+				}
 				limited, _ := readLimited(up.Body, captureLimit)
 				up.Body.Close()
 				usage := usageObject(dest, limited)
+				if !retriedLevel && geminiLevelSent(dest, target, levelResult) && levelNameRejected(up.StatusCode, limited) {
+					next := reasoning.LowestAfterReject(levelResult.Effort, effectiveLevels(target))
+					forced := target
+					forced.Force = next
+					retryBody, retryResult := reasoning.Rewrite(baseOutbound, thinking, forced)
+					if !reasoningBodyEqual(retryBody, outbound) {
+						retriedLevel = true
+						outbound = retryBody
+						levelResult = retryResult
+						if !ancillary && !seat.Login {
+							outbound = s.rewriteTry(r.Context(), outbound, call, prov.ID, dest)
+						}
+						if aggregateChat {
+							outbound = withStream(outbound, true)
+						}
+						sent = outboundModel(dest, outbound, upModel)
+						continue
+					}
+				}
 				class := outcome
 				if class == "" {
 					last = attemptResult{providerID: providerID, providerAccount: seat.Account, model: sent, outcome: "http_" + itoa(up.StatusCode), status: up.StatusCode, started: started, usage: usage, providerKeyID: providerKeyID, bytesIn: int64(len(outbound)), bytesOut: int64(len(limited))}
@@ -512,9 +552,9 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			if seat.Login && seat.Account == "claude" {
 				asked.Stream = false
 			}
-			reply := s.writeReply(w, r, up, proto, dest, asked, call, told, ancillary)
+			reply := s.writeReply(w, r, up, proto, dest, asked, call, told, ancillary, aggregateChat)
 			status, usage, output, complete, firstByte := reply.status, reply.usage, reply.output, reply.complete, reply.firstByte
-			outcome = OutcomeSuccess
+			outcome := OutcomeSuccess
 			if status < 200 || status >= 300 {
 				outcome = string(state.ClassUpstreamUnavailable)
 			}
@@ -898,8 +938,11 @@ type replyStats struct {
 	canceled  bool
 }
 
-func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) replyStats {
+func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary, aggregate bool) replyStats {
 	defer up.Body.Close()
+	if aggregate {
+		return s.writeAggregatedChat(w, r, up, inbound, dest, parsed, call, told, ancillary)
+	}
 	stream := parsed.Stream || strings.Contains(strings.ToLower(up.Header.Get("Content-Type")), "text/event-stream")
 	if stream {
 		return s.writeStream(w, r.Context(), up, inbound, dest, parsed.Model, call, told, ancillary)
@@ -940,6 +983,186 @@ func (s *Server) writeReply(w http.ResponseWriter, r *http.Request, up *http.Res
 		status: status, usage: usageObject(dest, body), output: output,
 		complete: complete, bytesOut: int64(len(out)),
 		canceled: !complete && r.Context().Err() != nil,
+	}
+}
+
+type aggregateToolCall struct {
+	id   string
+	kind string
+	name string
+	args strings.Builder
+}
+
+// writeAggregatedChat turns a provider's SSE chunks into the one Chat JSON
+// object the caller asked for. It exists for DashScope, which refuses a
+// non-streaming call while thinking is on.
+func (s *Server) writeAggregatedChat(w http.ResponseWriter, r *http.Request, up *http.Response, inbound, dest Protocol, parsed Parsed, call CallContext, told []RequestHook, ancillary bool) replyStats {
+	usage := usageScan{proto: ProtoChat}
+	var text strings.Builder
+	var reasoning strings.Builder
+	calls := map[int]*aggregateToolCall{}
+	finish := ""
+	upstreamError := ""
+	type function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	type toolCall struct {
+		Index    int      `json:"index"`
+		ID       string   `json:"id"`
+		Type     string   `json:"type"`
+		Function function `json:"function"`
+	}
+	type delta struct {
+		Content          string     `json:"content"`
+		ReasoningContent string     `json:"reasoning_content"`
+		ToolCalls        []toolCall `json:"tool_calls"`
+	}
+	type choice struct {
+		Delta        delta  `json:"delta"`
+		Message      delta  `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	}
+	consume := func(delta delta) {
+		text.WriteString(delta.Content)
+		reasoning.WriteString(delta.ReasoningContent)
+		for at, call := range delta.ToolCalls {
+			index := call.Index
+			if index == 0 && len(delta.ToolCalls) > 1 {
+				index = at
+			}
+			item := calls[index]
+			if item == nil {
+				item = &aggregateToolCall{}
+				calls[index] = item
+			}
+			if call.ID != "" {
+				item.id = call.ID
+			}
+			if call.Type != "" {
+				item.kind = call.Type
+			}
+			if call.Function.Name != "" {
+				item.name = call.Function.Name
+			}
+			if call.Function.Arguments != "" {
+				item.args.WriteString(call.Function.Arguments)
+			}
+		}
+	}
+	err := readSSE(up.Body, func(data []byte) error {
+		usage.see(data)
+		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
+			return nil
+		}
+		var event struct {
+			Error   json.RawMessage `json:"error"`
+			Choices []choice        `json:"choices"`
+		}
+		if json.Unmarshal(data, &event) != nil {
+			return nil
+		}
+		if len(event.Error) > 0 && !bytes.Equal(bytes.TrimSpace(event.Error), []byte("null")) {
+			upstreamError = string(event.Error)
+			return nil
+		}
+		for _, row := range event.Choices {
+			consume(row.Delta)
+			consume(row.Message)
+			if row.FinishReason != "" {
+				finish = row.FinishReason
+			}
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, io.EOF) {
+		writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), string(state.ClassUpstreamUnavailable))
+		s.observe(told, call, nil, false)
+		return replyStats{status: http.StatusBadGateway, canceled: r.Context().Err() != nil}
+	}
+	if upstreamError != "" {
+		writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), upstreamError)
+		s.observe(told, call, nil, false)
+		return replyStats{status: http.StatusBadGateway}
+	}
+	message := map[string]any{"role": "assistant", "content": text.String()}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+	}
+	if len(calls) > 0 {
+		order := make([]int, 0, len(calls))
+		for index := range calls {
+			order = append(order, index)
+		}
+		sort.Ints(order)
+		list := make([]map[string]any, 0, len(order))
+		for _, index := range order {
+			item := calls[index]
+			kind := item.kind
+			if kind == "" {
+				kind = "function"
+			}
+			args := item.args.String()
+			if args == "" {
+				args = "{}"
+			}
+			list = append(list, map[string]any{
+				"id": item.id, "type": kind,
+				"function": map[string]any{"name": item.name, "arguments": args},
+			})
+		}
+		message["tool_calls"] = list
+		if text.Len() == 0 {
+			message["content"] = nil
+		}
+	}
+	if finish == "" {
+		if len(calls) > 0 {
+			finish = "tool_calls"
+		} else {
+			finish = "stop"
+		}
+	}
+	reply := map[string]any{
+		"id": "chatcmpl_aigate", "object": "chat.completion", "model": parsed.Model,
+		"choices": []any{map[string]any{
+			"index": 0, "finish_reason": finish, "message": message,
+		}},
+	}
+	if object := usage.object(); len(object) > 0 {
+		reply["usage"] = object
+	}
+	out, marshalErr := json.Marshal(reply)
+	if marshalErr != nil {
+		writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), string(state.ClassUpstreamUnavailable))
+		s.observe(told, call, nil, false)
+		return replyStats{status: http.StatusBadGateway}
+	}
+	if inbound != ProtoChat {
+		converted, err := aiconv.ConvertReply(aiconv.Protocol(dest), aiconv.Protocol(inbound), out, &aiconv.Options{Model: parsed.Model})
+		if err != nil {
+			writeProtocolError(w, inbound, http.StatusBadGateway, string(state.ClassUpstreamUnavailable), err.Error())
+			s.observe(told, call, nil, false)
+			return replyStats{status: http.StatusBadGateway, usage: usage.object()}
+		}
+		out = converted
+	}
+	status := http.StatusOK
+	if !ancillary {
+		status, out = s.rewriteReply(r.Context(), status, out, call)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(out)
+	complete := status >= 200 && status < 300 && len(out) <= captureLimit
+	s.observe(told, call, out, complete)
+	output := ""
+	if complete && !ancillary {
+		output = replyText(inbound, out)
+	}
+	return replyStats{
+		status: status, usage: usage.object(), output: output, complete: complete,
+		bytesOut: int64(len(out)),
 	}
 }
 

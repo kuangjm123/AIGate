@@ -674,7 +674,8 @@ func codexModels(models []Model) []codexcat.Model {
 	for _, model := range models {
 		out = append(out, codexcat.Model{
 			ID: model.ID, Name: model.Name, Context: model.Context,
-			Reasoning: model.Reasoning, Vision: model.Vision,
+			Reasoning: model.Reasoning, ReasoningEfforts: model.ReasoningEfforts,
+			ReasoningEffortsKnown: model.ReasoningEffortsKnown, Vision: model.Vision,
 		})
 	}
 	return out

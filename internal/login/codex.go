@@ -176,6 +176,9 @@ func codexModels(m Machine, path, access, accountID string) ([]Model, bool) {
 			Slug           string `json:"slug"`
 			Visibility     string `json:"visibility"`
 			SupportedInAPI bool   `json:"supported_in_api"`
+			Levels         []struct {
+				Effort string `json:"effort"`
+			} `json:"supported_reasoning_levels"`
 		} `json:"models"`
 	}
 	if json.Unmarshal(body, &listed) != nil {
@@ -186,7 +189,18 @@ func codexModels(m Machine, path, access, accountID string) ([]Model, bool) {
 		if model.Slug == "" || !model.SupportedInAPI || model.Visibility != "list" {
 			continue
 		}
-		out = append(out, Model{ID: model.Slug, Name: model.Slug})
+		levels := make([]string, 0, len(model.Levels))
+		for _, level := range model.Levels {
+			level := strings.ToLower(strings.TrimSpace(level.Effort))
+			if level != "" {
+				levels = append(levels, level)
+			}
+		}
+		out = append(out, Model{
+			ID: model.Slug, Name: model.Slug,
+			Reasoning: len(levels) > 0, ReasoningEfforts: levels,
+			ReasoningEffortsKnown: model.Levels != nil,
+		})
 	}
 	if out == nil {
 		out = []Model{}

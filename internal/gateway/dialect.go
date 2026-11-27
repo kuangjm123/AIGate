@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/kuangjm123/aiconv"
@@ -391,6 +392,21 @@ func withModel(raw []byte, model string) []byte {
 	return out
 }
 
+// withStream sets the body's stream flag. It is used when the gateway asks a
+// provider for SSE although the caller asked for one JSON object.
+func withStream(raw []byte, stream bool) []byte {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil {
+		return append([]byte(nil), raw...)
+	}
+	doc["stream"] = json.RawMessage(strconv.FormatBool(stream))
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return append([]byte(nil), raw...)
+	}
+	return out
+}
+
 // replyText reads the assistant text from a provider body in its dialect.
 func replyText(proto Protocol, body []byte) string {
 	var doc map[string]json.RawMessage
@@ -619,13 +635,15 @@ func joinUnder(basePath, suffix string) string {
 }
 
 type catalogEntry struct {
-	ID        string
-	Name      string
-	Owner     string
-	Bare      string
-	Context   int
-	Reasoning bool
-	Vision    *bool
+	ID                    string
+	Name                  string
+	Owner                 string
+	Bare                  string
+	Context               int
+	Reasoning             bool
+	ReasoningEfforts      []string
+	ReasoningEffortsKnown bool
+	Vision                *bool
 }
 
 func catalog(cfg state.Config, kind string) []catalogEntry {
@@ -661,7 +679,13 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 			if group.ID == "" {
 				continue
 			}
-			add(catalogEntry{ID: group.ID, Owner: group.ID, Bare: group.ID})
+			entry := catalogEntry{ID: group.ID, Owner: group.ID, Bare: group.ID}
+			if len(group.Levels) > 0 {
+				entry.Reasoning = true
+				entry.ReasoningEfforts = append([]string(nil), group.Levels...)
+				entry.ReasoningEffortsKnown = true
+			}
+			add(entry)
 		}
 		for _, route := range cfg.Routes {
 			owner := route.ID
@@ -697,7 +721,10 @@ func catalog(cfg state.Config, kind string) []catalogEntry {
 			}
 			add(catalogEntry{
 				ID: owner + "/" + model, Name: name, Owner: owner, Bare: model,
-				Context: info.Context, Reasoning: info.Reasoning, Vision: info.Vision,
+				Context: info.Context, Reasoning: info.Reasoning,
+				ReasoningEfforts:      append([]string(nil), info.ReasoningEfforts...),
+				ReasoningEffortsKnown: info.ReasoningEffortsKnown,
+				Vision:                info.Vision,
 			})
 		}
 	}
