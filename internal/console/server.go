@@ -878,6 +878,9 @@ func (s *Server) createRoute(w http.ResponseWriter, r *http.Request) int {
 	}
 	route, present, err := decodeRoute(body)
 	if err != nil {
+		if _, ok := state.AsValidation(err); ok {
+			return writeErr(w, err)
+		}
 		return badJSON(w)
 	}
 	var saved state.Route
@@ -912,6 +915,9 @@ func (s *Server) putRoute(w http.ResponseWriter, r *http.Request, id string) int
 	}
 	in, present, err := decodeRoute(body)
 	if err != nil {
+		if _, ok := state.AsValidation(err); ok {
+			return writeErr(w, err)
+		}
 		return badJSON(w)
 	}
 	var saved state.Route
@@ -1964,6 +1970,9 @@ func decodeRoute(body []byte) (state.Route, bool, error) {
 		return state.Route{}, false, err
 	}
 	route := state.Route{ModelMatch: in.ModelMatch, ProviderIDs: in.ProviderIDs, Routing: in.Routing, Weights: in.Weights}
+	if route.ModelMatch == "" || strings.TrimSpace(route.ModelMatch) != route.ModelMatch || strings.Contains(route.ModelMatch, ",") {
+		return state.Route{}, false, &state.ValidationError{Reason: "route_model"}
+	}
 	_, present := raw["eligible"]
 	if present && in.Eligible != nil {
 		route.EligibleSet = true

@@ -147,6 +147,41 @@ func TestRouteCarriesRoutingAndWeights(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "routing") {
 		t.Fatalf("bad routing %d %s", res.StatusCode, body)
 	}
+	res, body = do(t, http.MethodPost, srv.URL+"/routes", token, []byte(`{"modelMatch":"one, two","providerIds":["p"]}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "route_model") {
+		t.Fatalf("comma model %d %s", res.StatusCode, body)
+	}
+	res, body = do(t, http.MethodPost, srv.URL+"/routes", token, []byte(`{"modelMatch":"","providerIds":["p"]}`))
+	if res.StatusCode != http.StatusBadRequest || !strings.Contains(body, "route_model") {
+		t.Fatalf("empty model %d %s", res.StatusCode, body)
+	}
+}
+
+func TestLegacyInvalidRouteCanBeDeleted(t *testing.T) {
+	store := loadTemp(t)
+	if err := store.Update(func(cfg *state.Config) error {
+		cfg.Providers = []state.Provider{{ID: "p", Name: "P", Protocol: "chat", BaseURL: "https://api.example.com", Models: []string{"m"}, Credential: "k"}}
+		cfg.Routes = []state.Route{
+			{ID: "empty", ModelMatch: "", ProviderIDs: []string{"p"}},
+			{ID: "comma", ModelMatch: "m, n", ProviderIDs: []string{"p"}},
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := withSession(t, store)
+	srv := httptest.NewServer(&Server{Store: store, Host: memHost{store: store}})
+	defer srv.Close()
+	for _, id := range []string{"empty", "comma"} {
+		res, body := do(t, http.MethodDelete, srv.URL+"/routes/"+id, token, nil)
+		if res.StatusCode != http.StatusNoContent {
+			t.Fatalf("delete %s %d %s", id, res.StatusCode, body)
+		}
+	}
+	snap := store.Current()
+	if snap == nil || len(snap.Config.Routes) != 0 {
+		t.Fatalf("routes after delete %#v", snap)
+	}
 }
 
 func TestGroupCRUDAndReferences(t *testing.T) {

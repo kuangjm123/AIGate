@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ClaudeCodeTabState">
+    <option name="tabSessions">
+      <map>
+        <entry key="0">
+          <value>
+            <TabSessionState>
+              <option name="projectPath" value="C:\repository\AIGate" />
+              <option name="provider" value="dsh" />
+              <option name="model" value="gpt-6-astra" />
+              <option name="permissionMode" value="default" />
+              <option name="reasoningEffort" value="high" />
+              <option name="claudeSupplierId" value="__session_supplier_unavailable__" />
+              <option name="codexSupplierId" value="__codex_cli_login__" />
+              <option name="ompApprovalMode" value="" />
+              <option name="reviewTargetId" value="a7b53ad7-1058-4b71-9d68-05fdbbe44cfa" />
+            </TabSessionState>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+</project>

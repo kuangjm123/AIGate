@@ -48,7 +48,12 @@ func statusFor(t *testing.T, m Machine, target Target, id string) Status {
 
 func TestOffersSkipHiddenAndNonChat(t *testing.T) {
 	cfg := state.Config{
-		Routes: []state.Route{{ID: "r", ModelMatch: "routed"}},
+		Routes: []state.Route{
+			{ID: "valid", ModelMatch: "routed", ProviderIDs: []string{"p"}},
+			{ID: "empty", ModelMatch: "", ProviderIDs: []string{"p"}},
+			{ID: "spaced", ModelMatch: " spaced", ProviderIDs: []string{"p"}},
+			{ID: "comma", ModelMatch: "one, two", ProviderIDs: []string{"p"}},
+		},
 		Groups: []state.Group{{ID: "g", Members: []string{"p/chat"}}},
 		Providers: []state.Provider{{
 			ID: "p", Models: []string{"routed", "chat", "pic", "gone"},
@@ -139,6 +144,411 @@ func TestClaudeUnreadableFileIsNotOverwritten(t *testing.T) {
 	}
 	if st := mustStatus(t, m, "claude"); st.State != "unknown" {
 		t.Fatalf("status %#v", st)
+	}
+}
+
+func TestClaudeConnectWiresGatewaySettings(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{
+  "theme": "dark",
+  "model": "sonnet",
+  "env": {
+    "FOO": "bar",
+    "ANTHROPIC_MODEL": "claude-opus-4-6",
+    "ANTHROPIC_API_KEY": "sk-real",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "old-sonnet",
+    "CLAUDE_CODE_USE_BEDROCK": "1"
+  }
+}
+`)
+	models := []Model{
+		{ID: "p1/main", Name: "Main", Bare: "main", Context: 1_000_000},
+		{ID: "p1/opus", Name: "Opus", Bare: "opus"},
+		{ID: "p1/sonnet", Name: "Sonnet", Bare: "sonnet"},
+		{ID: "p1/haiku", Name: "Haiku", Bare: "haiku", Context: 1_000_000},
+		{ID: "p1/fable", Name: "Fable", Bare: "fable"},
+	}
+	if err := Connect(m, "claude", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	env := claudeEnvOf(t, doc)
+	if doc["theme"] != "dark" || doc["model"] != "p1/main[1m]" {
+		t.Fatalf("top level %#v", doc)
+	}
+	want := map[string]string{
+		"ANTHROPIC_BASE_URL":                         gw().Origin,
+		"ANTHROPIC_AUTH_TOKEN":                       "aigate-claude",
+		"ANTHROPIC_API_KEY":                          "",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":               "p1/opus",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL":             "p1/sonnet",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL":              "p1/haiku[1m]",
+		"ANTHROPIC_DEFAULT_FABLE_MODEL":              "p1/fable",
+		"ANTHROPIC_SMALL_FAST_MODEL":                 "p1/haiku[1m]",
+		"CLAUDE_CODE_SUBAGENT_MODEL":                 "p1/main[1m]",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+		"CLAUDE_CODE_USE_BEDROCK":                    "",
+		"CLAUDE_CODE_USE_VERTEX":                     "",
+		"CLAUDE_CODE_USE_FOUNDRY":                    "",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS":              "",
+		"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD":     "",
+		"CLAUDE_CODE_USE_MANTLE":                     "",
+	}
+	for key, value := range want {
+		if env[key] != value {
+			t.Fatalf("%s = %#v, want %q", key, env[key], value)
+		}
+	}
+	if _, ok := env["ANTHROPIC_MODEL"]; ok {
+		t.Fatalf("ANTHROPIC_MODEL left behind: %#v", env)
+	}
+	if env["FOO"] != "bar" {
+		t.Fatalf("other env %#v", env)
+	}
+	if st := mustStatus(t, m, "claude"); st.State != "on" {
+		t.Fatalf("status %#v", st)
+	}
+
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	doc = readDoc(t, path)
+	env = claudeEnvOf(t, doc)
+	if doc["model"] != "sonnet" || env["ANTHROPIC_MODEL"] != "claude-opus-4-6" || env["ANTHROPIC_API_KEY"] != "sk-real" || env["ANTHROPIC_DEFAULT_SONNET_MODEL"] != "old-sonnet" || env["CLAUDE_CODE_USE_BEDROCK"] != "1" || env["FOO"] != "bar" {
+		t.Fatalf("restored %#v env %#v", doc, env)
+	}
+	for _, key := range []string{
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+		"ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "CLAUDE_CODE_USE_VERTEX",
+		"CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+		"CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_USE_MANTLE",
+	} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s was not removed: %#v", key, env)
+		}
+	}
+	if st := mustStatus(t, m, "claude"); st.State != "off" {
+		t.Fatalf("after disconnect %#v", st)
+	}
+}
+
+func TestClaudeConnectWritesModelPickerAndRestores(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{
+  "model": "sonnet",
+  "modelPicker": {
+    "options": [
+      {"description": "custom", "label": "Mine", "model": "mine"}
+    ]
+  }
+}`)
+	models := []Model{
+		{ID: "deepseek-flash", Name: "DeepSeek Flash", Bare: "deepseek-flash"},
+		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", Bare: "deepseek-v4-pro"},
+		{ID: "group/smart-split", Name: "Smart split", Bare: "smart-split"},
+		{ID: "p1/private", Name: "Provider only", Bare: "private"},
+	}
+	if err := Connect(m, "claude", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	picker := claudePickerModels(t, doc)
+	for _, id := range []string{"deepseek-flash", "deepseek-v4-pro", "group/smart-split", "p1/private", "mine"} {
+		if _, ok := picker[id]; !ok {
+			t.Fatalf("modelPicker lost %s: %#v", id, picker)
+		}
+	}
+	for _, id := range []string{"deepseek-flash", "deepseek-v4-pro", "group/smart-split", "p1/private"} {
+		if got := picker[id]["description"]; got != "via AIGate" {
+			t.Fatalf("%s description %#v", id, got)
+		}
+	}
+	if st := mustStatus(t, m, "claude"); st.State != "on" {
+		t.Fatalf("status %#v", st)
+	}
+
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	doc = readDoc(t, path)
+	picker = claudePickerModels(t, doc)
+	if len(picker) != 1 || picker["mine"] == nil {
+		t.Fatalf("original modelPicker was not restored: %#v", picker)
+	}
+}
+
+func TestClaudeDisconnectKeepsAChangedModelPicker(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{"model":"sonnet"}`)
+	if err := Connect(m, "claude", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	picker, ok := doc["modelPicker"].(map[string]any)
+	if !ok {
+		t.Fatalf("modelPicker missing %#v", doc)
+	}
+	picker["options"] = append(picker["options"].([]any), map[string]any{
+		"description": "custom", "label": "Mine", "model": "mine",
+	})
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	if st := mustStatus(t, m, "claude"); st.State != "drift" {
+		t.Fatalf("status %#v", st)
+	}
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	restored := claudePickerModels(t, readDoc(t, path))
+	if restored["mine"] == nil {
+		t.Fatalf("changed modelPicker was overwritten: %#v", restored)
+	}
+}
+
+func TestClaudeDisconnectKeepsUserChanges(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{"model":"sonnet","env":{"ANTHROPIC_API_KEY":"sk-original","ANTHROPIC_DEFAULT_SONNET_MODEL":"old-sonnet"}}`)
+	if err := Connect(m, "claude", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	env := claudeEnvOf(t, doc)
+	env["ANTHROPIC_BASE_URL"] = "http://127.0.0.1:9999"
+	env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "user-sonnet"
+	env["CLAUDE_CODE_USE_VERTEX"] = "1"
+	env["ANTHROPIC_MODEL"] = "user-model"
+	doc["model"] = "user-top-model"
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	if st := mustStatus(t, m, "claude"); st.State != "drift" {
+		t.Fatalf("status %#v", st)
+	}
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	doc = readDoc(t, path)
+	env = claudeEnvOf(t, doc)
+	if doc["model"] != "user-top-model" || env["ANTHROPIC_BASE_URL"] != "http://127.0.0.1:9999" || env["ANTHROPIC_DEFAULT_SONNET_MODEL"] != "user-sonnet" || env["CLAUDE_CODE_USE_VERTEX"] != "1" || env["ANTHROPIC_MODEL"] != "user-model" {
+		t.Fatalf("user values lost %#v env %#v", doc, env)
+	}
+	if _, ok := env["ANTHROPIC_AUTH_TOKEN"]; ok {
+		t.Fatalf("unchanged gateway key was not removed: %#v", env)
+	}
+	if env["ANTHROPIC_API_KEY"] != "sk-original" {
+		t.Fatalf("unchanged empty value was not restored: %#v", env)
+	}
+}
+
+func TestClaudeStatusNoticesAMissingGatewayGuard(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{"model":"sonnet"}`)
+	for _, key := range []string{"ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_VERTEX"} {
+		if err := Connect(m, "claude", gw(), offers()); err != nil {
+			t.Fatal(err)
+		}
+		doc := readDoc(t, path)
+		env := claudeEnvOf(t, doc)
+		if value, ok := env[key]; !ok || value != "" {
+			t.Fatalf("%s after connect: %#v", key, env[key])
+		}
+		delete(env, key)
+		body, err := marshalJSON(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, path, string(body))
+		if st := mustStatus(t, m, "claude"); st.State != "drift" {
+			t.Fatalf("%s removed, status %#v", key, st)
+		}
+	}
+}
+
+func TestClaudeTierAliasIsNotDrift(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{"model":"sonnet"}`)
+	models := []Model{
+		{ID: "p1/main", Name: "Main", Bare: "main"},
+		{ID: "p1/fable", Name: "Fable", Bare: "fable"},
+	}
+	if err := Connect(m, "claude", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	doc["model"] = "fable"
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	if st := mustStatus(t, m, "claude"); st.State != "on" {
+		t.Fatalf("tier alias state %#v", st)
+	}
+	env := claudeEnvOf(t, doc)
+	env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "p1/other"
+	body, err = marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	if st := mustStatus(t, m, "claude"); st.State != "drift" {
+		t.Fatalf("changed tier state %#v", st)
+	}
+	env["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "p1/fable"
+	body, err = marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if doc = readDoc(t, path); doc["model"] != "fable" {
+		t.Fatalf("user alias was overwritten: %#v", doc)
+	}
+}
+
+func TestClaudePickerSelectionIsNotDrift(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{"model":"sonnet"}`)
+	models := []Model{
+		{ID: "deepseek-flash", Name: "DeepSeek Flash", Bare: "deepseek-flash"},
+		{ID: "deepseek-v4-pro", Name: "DeepSeek V4 Pro", Bare: "deepseek-v4-pro"},
+	}
+	if err := Connect(m, "claude", gw(), models); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	doc["model"] = "deepseek-v4-pro"
+	body, err := marshalJSON(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, string(body))
+	st := mustStatus(t, m, "claude")
+	if st.State != "on" || st.Model != "deepseek-v4-pro" {
+		t.Fatalf("picker selection state %#v", st)
+	}
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if doc = readDoc(t, path); doc["model"] != "deepseek-v4-pro" {
+		t.Fatalf("user picker choice was overwritten: %#v", doc)
+	}
+}
+
+func TestClaudeSettingsWithUTF8BOMAreReadable(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, "\xef\xbb\xbf"+`{"model":"sonnet","env":{"FOO":"bar"}}`)
+	if st := mustStatus(t, m, "claude"); st.State != "off" {
+		t.Fatalf("status before connect %#v", st)
+	}
+	if err := Connect(m, "claude", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if st := mustStatus(t, m, "claude"); st.State != "on" {
+		t.Fatalf("status after connect %#v", st)
+	}
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	env := claudeEnvOf(t, doc)
+	if doc["model"] != "sonnet" || env["FOO"] != "bar" {
+		t.Fatalf("restored %#v env %#v", doc, env)
+	}
+}
+
+func TestClaudeUsesConfiguredDirectory(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "home")
+	configDir := filepath.Join(root, "claude-alt")
+	m := Machine{
+		Home:            home,
+		StashDir:        filepath.Join(root, "stash"),
+		ClaudeConfigDir: configDir,
+		LookPath:        func(string) bool { return false },
+	}
+	altPath := filepath.Join(configDir, "settings.json")
+	writeFile(t, altPath, `{"theme":"alt"}`)
+	writeFile(t, filepath.Join(home, ".claude", "settings.json"), `{"theme":"home"}`)
+	if err := Connect(m, "claude", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	alt := readDoc(t, altPath)
+	homeDoc := readDoc(t, filepath.Join(home, ".claude", "settings.json"))
+	if alt["theme"] != "alt" || alt["model"] != "p1/demo" {
+		t.Fatalf("configured file %#v", alt)
+	}
+	if homeDoc["theme"] != "home" || homeDoc["model"] != nil {
+		t.Fatalf("home file was changed %#v", homeDoc)
+	}
+	if st := mustStatus(t, m, "claude"); st.State != "on" || st.Where != altPath {
+		t.Fatalf("status %#v", st)
+	}
+}
+
+func TestClaudeLegacyNoteTakesMissingOriginalsFromTheFile(t *testing.T) {
+	m := testMachine(t)
+	path := claudePath(m)
+	writeFile(t, path, `{
+  "model": "p1/demo",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3425",
+    "ANTHROPIC_AUTH_TOKEN": "aigate-claude",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    "ANTHROPIC_MODEL": "legacy-model",
+    "ANTHROPIC_API_KEY": "sk-old",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "my-sonnet",
+    "CLAUDE_CODE_USE_BEDROCK": "1"
+  }
+}
+`)
+	writeFile(t, stashPath(m, "claude"), `{
+  "fields": {
+    "file": {"present": true},
+    "env": {"present": true},
+    "env.ANTHROPIC_BASE_URL": {"present": true, "value": "http://old.example"},
+    "env.ANTHROPIC_AUTH_TOKEN": {"present": true, "value": "old-token"},
+    "env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": {"present": true, "value": "0"},
+    "model": {"present": true, "value": "sonnet"}
+  },
+  "written": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3425",
+    "ANTHROPIC_AUTH_TOKEN": "aigate-claude",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    "model": "p1/demo"
+  }
+}
+`)
+	if err := Connect(m, "claude", gw(), offers()); err != nil {
+		t.Fatal(err)
+	}
+	if err := Disconnect(m, "claude"); err != nil {
+		t.Fatal(err)
+	}
+	doc := readDoc(t, path)
+	env := claudeEnvOf(t, doc)
+	if doc["model"] != "sonnet" || env["ANTHROPIC_BASE_URL"] != "http://old.example" || env["ANTHROPIC_AUTH_TOKEN"] != "old-token" || env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] != "0" {
+		t.Fatalf("old values lost %#v env %#v", doc, env)
+	}
+	if env["ANTHROPIC_MODEL"] != "legacy-model" || env["ANTHROPIC_API_KEY"] != "sk-old" || env["ANTHROPIC_DEFAULT_SONNET_MODEL"] != "my-sonnet" || env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+		t.Fatalf("newly recorded values lost %#v", env)
 	}
 }
 
@@ -1468,6 +1878,32 @@ func readDoc(t *testing.T, path string) map[string]any {
 		t.Fatal(err)
 	}
 	return doc
+}
+
+func claudeEnvOf(t *testing.T, doc map[string]any) map[string]any {
+	t.Helper()
+	env, _ := doc["env"].(map[string]any)
+	if env == nil {
+		t.Fatalf("missing env in %#v", doc)
+	}
+	return env
+}
+
+func claudePickerModels(t *testing.T, doc map[string]any) map[string]map[string]any {
+	t.Helper()
+	picker, _ := doc["modelPicker"].(map[string]any)
+	options, _ := picker["options"].([]any)
+	out := map[string]map[string]any{}
+	for _, item := range options {
+		option, _ := item.(map[string]any)
+		if option == nil {
+			continue
+		}
+		if id, _ := option["model"].(string); id != "" {
+			out[id] = option
+		}
+	}
+	return out
 }
 
 func boolPtr(v bool) *bool { return &v }

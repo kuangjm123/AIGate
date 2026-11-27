@@ -145,8 +145,10 @@ type Machine struct {
 	Home          string
 	StashDir      string
 	XDGConfigHome string
-	AppDirs       []string
-	LookPath      func(string) bool
+	// ClaudeConfigDir overrides ~/.claude when CLAUDE_CONFIG_DIR is set.
+	ClaudeConfigDir string
+	AppDirs         []string
+	LookPath        func(string) bool
 }
 
 func (m Machine) has(name string) bool {
@@ -161,9 +163,10 @@ func ThisMachine(stashDir string) (Machine, error) {
 		return Machine{}, fail("unknown")
 	}
 	m := Machine{
-		Home:          home,
-		StashDir:      stashDir,
-		XDGConfigHome: os.Getenv("XDG_CONFIG_HOME"),
+		Home:            home,
+		StashDir:        stashDir,
+		XDGConfigHome:   os.Getenv("XDG_CONFIG_HOME"),
+		ClaudeConfigDir: strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")),
 		LookPath: func(name string) bool {
 			_, err := exec.LookPath(name)
 			return err == nil
@@ -246,7 +249,7 @@ func Offers(cfg state.Config) []Model {
 		})
 	}
 	for _, route := range cfg.Routes {
-		if route.ModelMatch == "" {
+		if !offeredModelName(route.ModelMatch) {
 			continue
 		}
 		routed[route.ModelMatch] = true
@@ -289,6 +292,12 @@ func Offers(cfg state.Config) []Model {
 		}
 	}
 	return out
+}
+
+// offeredModelName rejects the historical route shapes that cannot name one
+// model. A comma is part of a model name, not a list separator.
+func offeredModelName(name string) bool {
+	return name != "" && strings.TrimSpace(name) == name && !strings.Contains(name, ",")
 }
 
 type wiring interface {

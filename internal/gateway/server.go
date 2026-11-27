@@ -31,6 +31,12 @@ type Server struct {
 	sticky        map[string]string
 	// Login reads subscription sign-ins for catalog and dial. Nil reads none.
 	Login func() login.Machine
+	// loginMu guards the short-lived discovery snapshot below. A catalog read
+	// must not wait for a slow sign-in, and concurrent requests share one read.
+	loginMu   sync.Mutex
+	loginAt   time.Time
+	loginSnap login.Snapshot
+	loginWait chan struct{}
 	// Prices reads list prices for a gateway token's spend cap. Nil prices nothing.
 	Prices price.Pricer
 	// routeStrategies and routingMem back routing strategies; both are lazy.
@@ -87,6 +93,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) int {
 	if r.Method == http.MethodPost && r.URL.Path == "/v1/magpie/usage/requests" {
 		return s.reportUsage(w, r, snap, admitted)
 	}
+	if r.Method == http.MethodPost && isCountTokensPath(r.URL.Path) {
+		return s.countTokens(w, r, snap, admitted)
+	}
 	proto, isDialect := Classify(r)
 	if !isDialect {
 		respond.Error(w, http.StatusServiceUnavailable, CodeNoDialect)
@@ -94,10 +103,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) int {
 	}
 	if r.Method == http.MethodGet {
 		if proto == ProtoCodex {
-			s.writeCodexCatalog(w, snap.Config, admitted, r.URL.Query().Get("kind"))
+			s.writeCodexCatalog(r.Context(), w, snap.Config, admitted, r.URL.Query().Get("kind"))
 			return http.StatusOK
 		}
-		writeCatalog(w, proto, snap.Config, admitted.allow, r.URL.Query().Get("kind"), s.loginEntries(r.URL.Query().Get("kind")))
+		writeCatalog(w, proto, snap.Config, admitted.allow, r.URL.Query().Get("kind"), s.loginEntries(r.Context(), r.URL.Query().Get("kind")))
 		return http.StatusOK
 	}
 	s.trafficActive.Add(1)

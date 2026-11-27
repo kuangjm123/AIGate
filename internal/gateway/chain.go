@@ -187,14 +187,12 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 	}
 	loginAccount, loginModel, explicitLogin := login.ParseID(parsed.Model)
 	loginSnap := login.Snapshot{Status: "off"}
-	if explicitLogin || s.Login != nil {
-		loginSnap = login.Discover(s.loginMachine())
-	}
 	var route routePick
 	var stateRoute state.Route
 	var seats []seatCandidate
 	var plannedGroup *groupPlan
 	if explicitLogin {
+		loginSnap = s.loginSnapshot(r.Context(), loginRequestWait)
 		meta.Model = loginModel
 		stateRoute, _ = snap.Config.RouteByModel(parsed.Model)
 		route = routePick{id: stateRoute.ID, found: stateRoute.ID != "", allows: func(class string) bool {
@@ -240,6 +238,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			auto := state.Group{ID: "", Members: autoGroupMembers(providerIDs, parsed.Model)}
 			var extra []seatCandidate
 			if _, _, catalogID := snap.Config.MatchCatalog(parsed.Model); !catalogID {
+				loginSnap = s.loginSnapshot(r.Context(), loginRequestWait)
 				extra = loginSeatCandidates(loginSnap, parsed.Model, "")
 			}
 			plannedGroup = s.planGroupWithExtra(r.Context(), snap.Config, parsed.Model, auto, "", nil, extra)
@@ -252,6 +251,7 @@ func (s *Server) serveModel(w http.ResponseWriter, r *http.Request, snap *state.
 			seats = providerCandidates(snap.Config, parsed.Model, providerIDs)
 			if !route.found {
 				if _, _, catalogID := snap.Config.MatchCatalog(parsed.Model); !catalogID {
+					loginSnap = s.loginSnapshot(r.Context(), loginRequestWait)
 					seats = append(seats, loginSeatCandidates(loginSnap, parsed.Model, "")...)
 				}
 			}

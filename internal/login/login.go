@@ -47,16 +47,18 @@ type Snapshot struct {
 // whose id equals an account id occupies that account's slot and this process
 // does not dial it.
 type Machine struct {
-	Home      string
-	Off       bool
-	PluginIDs []string
-	Client    *http.Client
-	Now       func() time.Time
-	ReadFile  func(string) ([]byte, error)
-	Claude    ClaudeFunc
-	CodexAuth string
-	CodexAPI  string
-	OpenAI    string
+	Home string
+	// ClaudeConfigDir overrides ~/.claude when CLAUDE_CONFIG_DIR is set.
+	ClaudeConfigDir string
+	Off             bool
+	PluginIDs       []string
+	Client          *http.Client
+	Now             func() time.Time
+	ReadFile        func(string) ([]byte, error)
+	Claude          ClaudeFunc
+	CodexAuth       string
+	CodexAPI        string
+	OpenAI          string
 	// WorkBuddyAuth is the CodeBuddy auth directory that holds
 	// workbuddy-desktop.info and workbuddy-desktop-ai.info.
 	// Empty means those files are not read. Tests set it; the process sets the real directory.

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -16,11 +17,11 @@ func (s *Server) loginMachine() login.Machine {
 	return s.Login()
 }
 
-func (s *Server) loginEntries(kind string) []catalogEntry {
+func (s *Server) loginEntries(ctx context.Context, kind string) []catalogEntry {
 	if kind != "" && kind != "chat" {
 		return nil
 	}
-	snap := login.Discover(s.loginMachine())
+	snap := s.loginSnapshot(ctx, loginCatalogWait)
 	if snap.Status != "ok" {
 		return nil
 	}
@@ -44,7 +45,7 @@ func (s *Server) loginEntries(kind string) []catalogEntry {
 func (s *Server) serveLogin(w http.ResponseWriter, r *http.Request, snap *state.Snapshot, proto Protocol, parsed Parsed, raw []byte, call CallContext, told []RequestHook, ancillary bool, meta attemptMeta, requestStart time.Time, requestID string) int {
 	account, model, _ := login.ParseID(parsed.Model)
 	meta.Model = model
-	discovered := login.Discover(s.loginMachine())
+	discovered := s.loginSnapshot(r.Context(), loginRequestWait)
 	started := requestStart
 	if started.IsZero() {
 		started = time.Now().UTC()

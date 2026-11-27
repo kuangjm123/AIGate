@@ -25,16 +25,23 @@ var claudePublic = []Model{
 // The production function does not put the subscription token on an HTTP request.
 type ClaudeFunc func(ctx context.Context, home string, model string, body []byte) ([]byte, error)
 
-func claudeCreds(home string) string {
-	return filepath.Join(home, ".claude", ".credentials.json")
+func claudeDir(m Machine) string {
+	if dir := strings.TrimSpace(m.ClaudeConfigDir); dir != "" {
+		return dir
+	}
+	return filepath.Join(m.Home, ".claude")
 }
 
-func claudeSettings(home string) string {
-	return filepath.Join(home, ".claude", "settings.json")
+func claudeCreds(m Machine) string {
+	return filepath.Join(claudeDir(m), ".credentials.json")
+}
+
+func claudeSettings(m Machine) string {
+	return filepath.Join(claudeDir(m), "settings.json")
 }
 
 func readClaude(m Machine) (Account, bool) {
-	path := claudeCreds(m.Home)
+	path := claudeCreds(m)
 	raw, err := m.read(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -42,6 +49,7 @@ func readClaude(m Machine) (Account, bool) {
 		}
 		return Account{ID: "claude", Name: "Claude Code", Readable: false}, true
 	}
+	raw = withoutUTF8BOM(raw)
 	if m.plugin("claude") {
 		var doc map[string]json.RawMessage
 		if json.Unmarshal(raw, &doc) != nil {
@@ -85,13 +93,14 @@ func readClaude(m Machine) (Account, bool) {
 }
 
 func claudeExtras(m Machine) ([]Model, bool) {
-	raw, err := m.read(claudeSettings(m.Home))
+	raw, err := m.read(claudeSettings(m))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, true
 		}
 		return nil, false
 	}
+	raw = withoutUTF8BOM(raw)
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, true
 	}
@@ -140,15 +149,23 @@ func claudeExtras(m Machine) ([]Model, bool) {
 	return out, true
 }
 
+func withoutUTF8BOM(b []byte) []byte {
+	return bytes.TrimPrefix(b, []byte{0xef, 0xbb, 0xbf})
+}
+
 // RunClaude starts the claude binary. The subscription token stays in Claude
 // Code's own file. Tool calls in the first assistant message are returned and
 // the process is stopped before Claude Code runs them.
 func RunClaude(ctx context.Context, home, model string, body []byte) ([]byte, error) {
+	return runClaude(ctx, home, os.Getenv("CLAUDE_CONFIG_DIR"), model, body)
+}
+
+func runClaude(ctx context.Context, home, configDir, model string, body []byte) ([]byte, error) {
 	prompt := claudePrompt(body)
 	cmd := exec.CommandContext(ctx, "claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose", "--include-partial-messages")
 	cmd.Dir = home
 	cmd.Stdin = strings.NewReader(prompt)
-	cmd.Env = claudeEnv(home)
+	cmd.Env = claudeEnv(home, configDir)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -166,17 +183,20 @@ func RunClaude(ctx context.Context, home, model string, body []byte) ([]byte, er
 	return reply, nil
 }
 
-func claudeEnv(home string) []string {
+func claudeEnv(home, configDir string) []string {
 	var env []string
 	for _, item := range os.Environ() {
 		key, _, _ := strings.Cut(item, "=")
 		switch key {
-		case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN":
+		case "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR":
 			continue
 		}
 		env = append(env, item)
 	}
 	env = append(env, "HOME="+home)
+	if dir := strings.TrimSpace(configDir); dir != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+dir)
+	}
 	return env
 }
 

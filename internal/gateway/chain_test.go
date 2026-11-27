@@ -553,7 +553,9 @@ func TestStreamReachesTheClientBeforeTheUpstreamFinishes(t *testing.T) {
 func TestCatalogAndTranslatedAnthropic(t *testing.T) {
 	var shape string
 	var maxTokens int
+	var seenPath string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
 		var doc struct {
 			MaxTokens int                 `json:"max_tokens"`
 			Messages  []map[string]string `json:"messages"`
@@ -575,8 +577,41 @@ func TestCatalogAndTranslatedAnthropic(t *testing.T) {
 		t.Fatalf("catalog %d %s", rr.Code, rr.Body.String())
 	}
 	rr = callGateway(t, srv, secret, http.MethodPost, "/v1/messages", `{"model":"claude","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`)
-	if rr.Code != http.StatusOK || shape != "hello" || maxTokens != 16 || !strings.Contains(rr.Body.String(), "pong") || !strings.Contains(rr.Body.String(), `"type":"message"`) {
-		t.Fatalf("translated %d shape %q max_tokens %d body %s", rr.Code, shape, maxTokens, rr.Body.String())
+	if rr.Code != http.StatusOK || shape != "hello" || maxTokens != 16 || seenPath != "/v1/chat/completions" || !strings.Contains(rr.Body.String(), "pong") || !strings.Contains(rr.Body.String(), `"type":"message"`) {
+		t.Fatalf("translated %d path %q shape %q max_tokens %d body %s", rr.Code, seenPath, shape, maxTokens, rr.Body.String())
+	}
+}
+
+func TestClaudeCodeSystemMessageReachesAChatProvider(t *testing.T) {
+	var got []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var doc struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&doc)
+		got = doc.Messages
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"pong"}}]}`))
+	}))
+	defer up.Close()
+	store, secret := dialStore(t, []state.Provider{{
+		ID: "p1", Protocol: "chat", BaseURL: up.URL, Models: []string{"claude"}, Credential: "k",
+	}}, []state.Route{{ID: "r1", ModelMatch: "claude", ProviderIDs: []string{"p1"}}})
+	srv := &Server{Store: store}
+	body := `{"model":"claude","max_tokens":16,"system":[{"type":"text","text":"top system"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"system","content":[{"type":"text","text":"environment context"}]}]}`
+	rr := callGateway(t, srv, secret, http.MethodPost, "/v1/messages", body)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "pong") {
+		t.Fatalf("translated %d %s", rr.Code, rr.Body.String())
+	}
+	if len(got) != 3 || got[0].Role != "system" || got[0].Content != "top system" ||
+		got[1].Role != "system" || got[1].Content != "environment context" ||
+		got[2].Role != "user" || got[2].Content != "hi" {
+		t.Fatalf("messages %#v", got)
 	}
 }
 

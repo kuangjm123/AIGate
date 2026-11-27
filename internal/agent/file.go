@@ -43,7 +43,7 @@ func loadRecord(m Machine, id string) (record, bool, error) {
 		return record{}, false, fail("unknown")
 	}
 	var rec record
-	if json.Unmarshal(b, &rec) != nil || rec.Fields == nil {
+	if json.Unmarshal(withoutUTF8BOM(b), &rec) != nil || rec.Fields == nil {
 		return record{}, true, fail("unknown")
 	}
 	return rec, true, nil
@@ -84,10 +84,11 @@ func readJSONFile(path string) (map[string]any, []byte, bool, error) {
 		}
 		return nil, nil, false, fail("unknown")
 	}
-	if len(bytes.TrimSpace(b)) == 0 {
+	raw := withoutUTF8BOM(b)
+	if len(bytes.TrimSpace(raw)) == 0 {
 		return map[string]any{}, b, true, nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil || doc == nil {
@@ -98,6 +99,10 @@ func readJSONFile(path string) (map[string]any, []byte, bool, error) {
 		return nil, b, true, fail("unknown")
 	}
 	return doc, b, true, nil
+}
+
+func withoutUTF8BOM(b []byte) []byte {
+	return bytes.TrimPrefix(b, []byte{0xef, 0xbb, 0xbf})
 }
 
 func marshalJSON(v any) ([]byte, error) {

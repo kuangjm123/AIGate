@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/kuangjm123/AIGate/internal/codexcat"
@@ -10,13 +11,13 @@ import (
 // writeCodexCatalog answers Codex's model_catalog_url with its own
 // models.json shape. A gateway token's model list filters the entries before
 // groups gain Codex's group/ prefix.
-func (s *Server) writeCodexCatalog(w http.ResponseWriter, cfg state.Config, admitted admission, kind string) {
+func (s *Server) writeCodexCatalog(ctx context.Context, w http.ResponseWriter, cfg state.Config, admitted admission, kind string) {
 	if kind == "" {
 		kind = "chat"
 	}
 	var entries []catalogEntry
 	if kind == "chat" {
-		entries = append(catalog(cfg, kind), s.loginEntries(kind)...)
+		entries = append(catalog(cfg, kind), s.loginEntries(ctx, kind)...)
 	}
 	models := make([]codexcat.Model, 0, len(entries))
 	for _, entry := range entries {

@@ -16,6 +16,8 @@
 | Gemini | `POST /v1beta/models/{model}:generateContent` 或 `:streamGenerateContent` |
 | Ollama | `POST /api/chat` |
 
+Claude Code 还会用 `POST /v1/messages/count_tokens`（或省略 `/v1`）估算上下文；网关本地估算并返回 `{"input_tokens":N}`，不访问供应商，也不记用量。Anthropic 模型名末尾的 `[1m]` 只表示 1M 上下文，网关查路由前会去掉。
+
 同一协议原样转发，只换上游模型名。不同协议之间翻译正文、流式事件、工具调用和推理文本。调用方看到的名字仍是目录里的那个。
 
 `GET /v1/models`、`GET /models`、`GET /api/tags`、`GET /v1beta/models` 返回目录。`GET /api/hello` 返回 `{"name":"aigate"}`，不需要令牌。
@@ -53,7 +55,7 @@ npm run build
 
 | 应用 | 接入时改的文件 |
 | --- | --- |
-| Claude Code | `~/.claude/settings.json` |
+| Claude Code | `$CLAUDE_CONFIG_DIR/settings.json`，未设置时 `~/.claude/settings.json` |
 | Codex | `~/.codex/config.toml` |
 | WorkBuddy | `~/.workbuddy/models.json` |
 | OpenCode | `~/.config/opencode/opencode.json`，已有 `opencode.jsonc` 时改那份 |

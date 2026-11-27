@@ -42,6 +42,10 @@ function groupPath(id) {
   return "/groups/" + encodeURIComponent(id);
 }
 
+function routePath(id) {
+  return "/routes/" + encodeURIComponent(id);
+}
+
 export function Routes({ tick, refresh, setMessage }) {
   const [routes, setRoutes] = useState([]);
   const [providers, setProviders] = useState([]);
@@ -59,6 +63,7 @@ export function Routes({ tick, refresh, setMessage }) {
   const [groupWeights, setGroupWeights] = useState("");
   const [groupEligible, setGroupEligible] = useState("");
   const [groupLimit, setGroupLimit] = useState(false);
+  const [editingRoute, setEditingRoute] = useState("");
   const [editingGroup, setEditingGroup] = useState("");
 
   useEffect(() => {
@@ -77,6 +82,7 @@ export function Routes({ tick, refresh, setMessage }) {
     : [];
 
   function clearRoute() {
+    setEditingRoute("");
     setModel("");
     setProviderIds("");
     setRouting("");
@@ -97,16 +103,35 @@ export function Routes({ tick, refresh, setMessage }) {
 
   async function saveRoute(event) {
     event.preventDefault();
-    const body = { modelMatch: model.trim(), providerIds: splitList(providerIds) };
+    const modelMatch = model.trim();
+    if (!modelMatch || modelMatch.includes(",")) {
+      setMessage({ kind: "error", text: "一个路由只匹配一个完整模型名，不能为空，也不能用逗号写多个模型。" });
+      return;
+    }
+    const body = { modelMatch, providerIds: splitList(providerIds) };
     if (routing) body.routing = routing;
     if (routing === "weight") body.weights = parseWeights(weights);
     if (limit) body.eligible = splitList(eligible);
     try {
-      await api("POST", "/routes", body);
+      if (editingRoute) {
+        await api("PUT", routePath(editingRoute), body);
+      } else {
+        await api("POST", "/routes", body);
+      }
       clearRoute();
       setMessage(null);
       refresh();
     } catch (err) { report(setMessage, err); }
+  }
+
+  function editRoute(route) {
+    setEditingRoute(route.id);
+    setModel(route.modelMatch || "");
+    setProviderIds((route.providerIds || []).join(", "));
+    setRouting(route.routing || "");
+    setWeights(weightText(route.weights));
+    setEligible((route.eligible || []).join(", "));
+    setLimit(Boolean(route.eligible));
   }
 
   function editGroup(group) {
@@ -147,22 +172,22 @@ export function Routes({ tick, refresh, setMessage }) {
   }
 
   return <div className="stack">
-    <Panel title="新建路由" description="模型名完全匹配后，由所选策略决定候选提供方的尝试顺序">
+    <Panel title={editingRoute ? `编辑路由 ${editingRoute}` : "新建路由"} description="模型名完全匹配后，由所选策略决定候选提供方的尝试顺序" actions={editingRoute ? <button type="button" className="ghost" onClick={clearRoute}>取消编辑</button> : null}>
       <form className="grid" onSubmit={saveRoute}>
-        <label>模型匹配<input value={model} placeholder="与请求中的模型名完全一致" onChange={(e) => setModel(e.target.value)}/></label>
+        <label>模型匹配<input value={model} required placeholder="与请求中的模型名完全一致" onChange={(e) => setModel(e.target.value)}/><small className="field-hint">一个路由只写一个完整模型名，不能用逗号写多个。</small></label>
         <label>提供方顺序<input value={providerIds} placeholder={providers.length ? `可用：${providers.map((p) => p.id).join(", ")}` : "提供方 ID，逗号分隔"} onChange={(e) => setProviderIds(e.target.value)}/></label>
         <label>策略<select value={routing} onChange={(e) => setRouting(e.target.value)}>{routeStrategies.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
         {routing === "weight" && <label>权重<input value={weights} placeholder="提供方=权重，如 p1=3, p2=1" onChange={(e) => setWeights(e.target.value)}/></label>}
         <label>降级类别<input value={eligible} placeholder="默认仅 upstream_unavailable" onChange={(e) => setEligible(e.target.value)}/></label>
         <div className="form-wide"><Toggle label="写入 eligible" hint="开启后使用上方类别；列表为空表示不降级" checked={limit} onChange={(e) => setLimit(e.target.checked)}/></div>
-        <div className="form-actions"><button type="submit">新建路由</button></div>
+        <div className="form-actions"><button type="submit">{editingRoute ? "更新路由" : "新建路由"}</button></div>
       </form>
     </Panel>
     <Panel title="路由列表" description={`${routes.length} 条路由`}><Table headers={["ID", "模型", "提供方", "策略", "eligible", "操作"]} rows={routes.map((route) => [
       <code>{route.id}</code>, <strong className="cell-title">{route.modelMatch}</strong>, (route.providerIds || []).join(", ") || "—",
       strategyLabel(route.routing) + (route.weights ? "（" + weightText(route.weights) + "）" : ""),
       route.eligible ? (route.eligible.length ? route.eligible.join(", ") : "空，不降级") : "默认",
-      <button type="button" className="danger" onClick={async () => { try { await api("DELETE", "/routes/" + route.id); refresh(); } catch (err) { report(setMessage, err); } }}>删除</button>,
+      <span className="row-actions"><button type="button" className="secondary" onClick={() => editRoute(route)}>编辑</button><button type="button" className="danger" onClick={async () => { try { await api("DELETE", routePath(route.id)); refresh(); } catch (err) { report(setMessage, err); } }}>删除</button></span>,
     ])} empty="还没有路由"/></Panel>
 
     <Panel title={editingGroup ? `编辑组 ${editingGroup}` : "新建路由组"} description="成员写 提供方/模型 或 group/组ID。组名就是请求里的模型名；cheap 和 expiring 只能配在组上" actions={editingGroup ? <button type="button" className="ghost" onClick={clearGroup}>取消编辑</button> : null}>

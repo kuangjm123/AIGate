@@ -419,6 +419,72 @@ func TestClaudeStreamStopsAtTheToolCall(t *testing.T) {
 	}
 }
 
+func TestClaudeDiscoveryUsesConfiguredDirectory(t *testing.T) {
+	home := t.TempDir()
+	configDir := t.TempDir()
+	write(t, filepath.Join(configDir, ".credentials.json"), `{"claudeAiOauth":{"accessToken":"configured-token"}}`)
+	write(t, filepath.Join(configDir, "settings.json"), `{"availableModels":["alt-extra"]}`)
+	write(t, filepath.Join(home, ".claude", ".credentials.json"), `{"claudeAiOauth":{"accessToken":"home-token"}}`)
+	write(t, filepath.Join(home, ".claude", "settings.json"), `{"availableModels":["home-extra"]}`)
+	got := Discover(Machine{Home: home, ClaudeConfigDir: configDir})
+	if got.Status != "ok" || len(got.Accounts) != 1 {
+		t.Fatalf("discover %#v", got)
+	}
+	account := got.Accounts[0]
+	if account.ID != "claude" || !hasModel(account, "alt-extra") || hasModel(account, "home-extra") {
+		t.Fatalf("models %#v", account.Models)
+	}
+}
+
+func TestClaudeDiscoveryReadsUTF8BOM(t *testing.T) {
+	home := t.TempDir()
+	write(t, filepath.Join(home, ".claude", ".credentials.json"), "\xef\xbb\xbf"+`{"claudeAiOauth":{"accessToken":"configured-token"}}`)
+	write(t, filepath.Join(home, ".claude", "settings.json"), "\xef\xbb\xbf"+`{"availableModels":["bom-extra"]}`)
+	got := Discover(Machine{Home: home})
+	if got.Status != "ok" || len(got.Accounts) != 1 {
+		t.Fatalf("discover %#v", got)
+	}
+	account := got.Accounts[0]
+	if !account.Readable || !hasModel(account, "bom-extra") {
+		t.Fatalf("account %#v", account)
+	}
+}
+
+func TestClaudeEnvFollowsTheConfigDir(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "/inherited")
+	t.Setenv("ANTHROPIC_BASE_URL", "http://vendor.example")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-vendor")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "vendor-token")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token")
+	env := claudeEnv("/home/user", "/accounts/one")
+	got := map[string]string{}
+	configDirs := 0
+	for _, item := range env {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
+		got[key] = value
+		if key == "CLAUDE_CONFIG_DIR" {
+			configDirs++
+		}
+	}
+	if got["HOME"] != "/home/user" || got["CLAUDE_CONFIG_DIR"] != "/accounts/one" || configDirs != 1 {
+		t.Fatalf("env %#v", got)
+	}
+	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("%s leaked into the child: %#v", key, got)
+		}
+	}
+	env = claudeEnv("/home/user", "")
+	for _, item := range env {
+		if key, _, _ := strings.Cut(item, "="); key == "CLAUDE_CONFIG_DIR" {
+			t.Fatalf("inherited CLAUDE_CONFIG_DIR leaked: %#v", env)
+		}
+	}
+}
+
 func hasModel(account Account, id string) bool {
 	for _, model := range account.Models {
 		if model.ID == id {

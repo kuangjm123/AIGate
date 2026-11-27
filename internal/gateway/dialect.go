@@ -132,7 +132,7 @@ func Parse(proto Protocol, r *http.Request, body []byte) (Parsed, error) {
 		p.Stream = jsonBool(doc["stream"])
 		p.Messages = responseTurns(doc["input"])
 	case ProtoAnthropic:
-		p.Model = jsonString(doc["model"])
+		p.Model = stripClaudeContextSuffix(jsonString(doc["model"]))
 		p.Stream = jsonBool(doc["stream"])
 		p.Messages = append(systemTurn(jsonText(doc["system"])), anthropicTurns(doc["messages"])...)
 	case ProtoOllama:
@@ -197,6 +197,14 @@ func jsonString(raw json.RawMessage) string {
 		return ""
 	}
 	return s
+}
+
+func stripClaudeContextSuffix(model string) string {
+	model = strings.TrimSpace(model)
+	if len(model) >= 4 && strings.EqualFold(model[len(model)-4:], "[1m]") {
+		return strings.TrimSpace(model[:len(model)-4])
+	}
+	return model
 }
 
 func jsonBool(raw json.RawMessage) bool {

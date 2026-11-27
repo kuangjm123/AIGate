@@ -16,11 +16,13 @@ func Dial(ctx context.Context, m Machine, account, model string, body []byte, st
 	}
 	switch account {
 	case "claude":
-		run := m.Claude
-		if run == nil {
-			run = RunClaude
+		var reply []byte
+		var err error
+		if m.Claude != nil {
+			reply, err = m.Claude(ctx, m.Home, model, body)
+		} else {
+			reply, err = runClaude(ctx, m.Home, m.ClaudeConfigDir, model, body)
 		}
-		reply, err := run(ctx, m.Home, model, body)
 		if err != nil {
 			return nil, err
 		}

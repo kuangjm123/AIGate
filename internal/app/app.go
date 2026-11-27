@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -306,7 +307,11 @@ func (a *App) loginMachine() login.Machine {
 	if err != nil {
 		home = ""
 	}
-	machine := login.Machine{Home: home, WorkBuddyAuth: login.DesktopAuthDir()}
+	machine := login.Machine{
+		Home:            home,
+		ClaudeConfigDir: strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")),
+		WorkBuddyAuth:   login.DesktopAuthDir(),
+	}
 	if paths := a.store.Paths(); paths.ConfigFile != "" {
 		machine.WorkBuddyStore = filepath.Join(filepath.Dir(paths.ConfigFile), "workbuddy-auth.json")
 	}

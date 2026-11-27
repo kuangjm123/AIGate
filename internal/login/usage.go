@@ -224,10 +224,11 @@ func windowName(seconds int64, fallback string) string {
 // claudeUsage runs Claude Code's own /usage answer. The subscription token
 // stays in Claude Code's file; nothing is sent to Anthropic.
 func claudeUsage(ctx context.Context, m Machine) (Quota, bool) {
-	raw, err := m.read(claudeCreds(m.Home))
+	raw, err := m.read(claudeCreds(m))
 	if err != nil {
 		return Quota{}, false
 	}
+	raw = withoutUTF8BOM(raw)
 	var doc map[string]json.RawMessage
 	if json.Unmarshal(raw, &doc) != nil {
 		return Quota{Account: "claude", Name: "Claude Code", Status: "unknown"}, true
@@ -242,11 +243,12 @@ func claudeUsage(ctx context.Context, m Machine) (Quota, bool) {
 	if json.Unmarshal(oauth, &token) != nil || strings.TrimSpace(token.AccessToken) == "" {
 		return Quota{Account: "claude", Name: "Claude Code", Status: "unknown"}, true
 	}
-	run := m.ClaudeUsage
-	if run == nil {
-		run = runClaudeUsage
+	var out []byte
+	if m.ClaudeUsage != nil {
+		out, err = m.ClaudeUsage(ctx, m.Home)
+	} else {
+		out, err = runClaudeUsage(ctx, m.Home, m.ClaudeConfigDir)
 	}
-	out, err := run(ctx, m.Home)
 	if err != nil {
 		return Quota{Account: "claude", Name: "Claude Code", Status: "unknown"}, true
 	}
@@ -257,10 +259,10 @@ func claudeUsage(ctx context.Context, m Machine) (Quota, bool) {
 	return Quota{Account: "claude", Name: "Claude Code", Status: "ok", Windows: windows}, true
 }
 
-func runClaudeUsage(ctx context.Context, home string) ([]byte, error) {
+func runClaudeUsage(ctx context.Context, home, configDir string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "claude", "-p", "/usage")
 	cmd.Dir = home
-	cmd.Env = claudeEnv(home)
+	cmd.Env = claudeEnv(home, configDir)
 	cmd.Stderr = io.Discard
 	return cmd.Output()
 }
